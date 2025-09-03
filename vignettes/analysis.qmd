@@ -62,6 +62,11 @@ length(fnames)  # how many slides
 #### build embedding matrix
 
 ```{r}
+#| label: build-embedding-matrix
+#| cache: true
+#| warning: false
+#| message: false
+
 # Load helper utils fns
 devtools::load_all()
 # Creating matrix for all the images
@@ -82,6 +87,7 @@ structure_of_matrix = as.data.frame(tensor_matrix_full)
 
 ```{r}
 #| output: False
+#| message: false
 
 # List available Assays
 curatedTCGAData("COAD", "*",version = "2.1.1", dry.run = TRUE) 
@@ -89,7 +95,7 @@ curatedTCGAData("READ", "*",version = "2.1.1", dry.run = TRUE)
 
 
 # Load COAD data with multiple assays
-coad_mae <- curatedTCGAData(
+coad_mae_full <- curatedTCGAData(
     diseaseCode = "COAD",
     assays = c("COAD_RNASeq2GeneNorm-20160128", "mRNAArray", "miRNASeqGene"),
     version = "2.1.1",
@@ -97,7 +103,7 @@ coad_mae <- curatedTCGAData(
 )
 
 # Load READ data (rectal)
-read_mae <- curatedTCGAData(
+read_mae_full <- curatedTCGAData(
     diseaseCode = "READ",
     assays = c("READ_RNASeq2GeneNorm-20160128", "mRNAArray", "miRNASeqGene"),
     version = "2.1.1",
@@ -111,7 +117,7 @@ read_mae <- curatedTCGAData(
 ```{r}
 #| output: False
 # ---- Extract sample-level metadata for READ ----- 
-read_clinical <- colData(read_mae)
+read_clinical <- colData(read_mae_full)
 
 # Check completeness of metadata attributes
 completeness <- colSums(!is.na(read_clinical)) / nrow(read_clinical) * 100
@@ -125,7 +131,7 @@ read_clinical_sub <- read_clinical[, which(completeness > 95)] %>%
 
 
 # ------ Extract sample-level metadata for COAD ------
-coad_clinical <- colData(coad_mae)
+coad_clinical <- colData(coad_mae_full)
 
 # Check completeness of metadata attributes
 completeness <- colSums(!is.na(coad_clinical)) / nrow(coad_clinical) * 100
@@ -142,57 +148,67 @@ coad_clinical_sub <- coad_clinical[, which(completeness > 95)] %>%
 
 ```{r}
 #| output: False
-
-# Ensure all columns exist in both datasets
+# Merge COAD + READ clinical metadata
 all_cols <- union(colnames(coad_clinical_sub), colnames(read_clinical_sub))
 
-# Start with COAD
 coad_clinical_full <- coad_clinical_sub
-missing_coad <- setdiff(all_cols, colnames(coad_clinical_sub))
-for (col in missing_coad) {
-  coad_clinical_full[[col]] <- NA
-}
+for (col in setdiff(all_cols, colnames(coad_clinical_sub))) coad_clinical_full[[col]] <- NA
 
-# Start with READ
 read_clinical_full <- read_clinical_sub
-missing_read <- setdiff(all_cols, colnames(read_clinical_sub))
-for (col in missing_read) {
-  read_clinical_full[[col]] <- NA
-}
+for (col in setdiff(all_cols, colnames(read_clinical_sub))) read_clinical_full[[col]] <- NA
 
-# Now you can rbind safely
-clinical_sub <- rbind(coad_clinical_full, read_clinical_full)
+clinical_combined <- rbind(coad_clinical_full, read_clinical_full)
 
-# Now subset to patients that actually have embeddings
+# Keep only patients with embeddings
+# Convert embedding matrix rownames to patient IDs (first 3 components)
+patient_ids_from_embedding <- sapply(strsplit(rownames(tensor_matrix_full), "-"), 
+                                    function(x) paste(x[1:3], collapse = "-"))
+rownames(tensor_matrix_full) <- patient_ids_from_embedding
+
+# Convert clinical data rownames to patient IDs (first 3 components)
+clinical_patient_ids <- sapply(strsplit(rownames(clinical_combined), "-"), 
+                              function(x) paste(x[1:3], collapse = "-"))
+rownames(clinical_combined) <- clinical_patient_ids
+
+# Remove duplicate patients from clinical data (keep first occurrence)
+clinical_combined <- clinical_combined[!duplicated(rownames(clinical_combined)), ]
+
+# Keep only patients with embeddings
 patients_with_embed <- rownames(tensor_matrix_full)
-clinical_sub <- clinical_sub[rownames(clinical_sub) %in% patients_with_embed, ]
-# Factorize categorical variables with 2–10 unique values
-n <- 2
-m <- 10
-numLv <- apply(clinical_sub, 2, function(x) length(unique(x)))
-slideAttrNames <- names(numLv[numLv >= n & numLv <= m])
+clinical_combined <- clinical_combined[rownames(clinical_combined) %in% patients_with_embed, ]
 
-for (slideAttrName in slideAttrNames) {
-  clinical_sub[[slideAttrName]] <- as.factor(clinical_sub[[slideAttrName]])
+# Factorize categorical variables with 2-10 unique values
+numLv <- apply(clinical_combined, 2, function(x) length(unique(na.omit(x))))
+slideAttrNames <- names(numLv[numLv >= 2 & numLv <= 10])
+
+for(attr in slideAttrNames){
+  clinical_combined[[attr]] <- as.factor(clinical_combined[[attr]])
 }
 
-# Final metadata dataframe
-metadata_df <- clinical_sub[slideAttrNames]
+# Create final metadata dataframe
+metadata_embed_df <- clinical_combined[slideAttrNames]
 
-# Subset embedding matrix to matching patients
-embedding_matrix <- tensor_matrix_full[rownames(tensor_matrix_full) %in% rownames(metadata_df), ]
-embedding_matrix <- embedding_matrix[!duplicated(rownames(embedding_matrix)), ]
+# Remove any rows with all NA values
+metadata_embed_df <- metadata_embed_df[rowSums(is.na(metadata_embed_df)) < ncol(metadata_embed_df), ]
 
-dim(metadata_df)
-dim(embedding_matrix)
+# Subset embedding matrix to match metadata patients
+embedding_embed_mat <- tensor_matrix_full[rownames(tensor_matrix_full) %in% rownames(metadata_embed_df), ]
+embedding_embed_mat <- embedding_embed_mat[!duplicated(rownames(embedding_embed_mat)), ]
 
-# Run embedding separation analysis
-res <- HistoImageR:::analyze_embedding_separation(embedding_matrix, metadata_df)
+# Ensure exact same patients in both datasets
+common_patients <- intersect(rownames(embedding_embed_mat), rownames(metadata_embed_df))
+embedding_embed_mat <- embedding_embed_mat[common_patients, ]
+metadata_embed_df <- metadata_embed_df[common_patients, ]
 
-res$plots
+# Run HistoImageR embedding separation analysis
+res_embed <- HistoImageR:::analyze_embedding_separation(embedding_embed_mat, metadata_embed_df)
+
+# View results
+res_embed$plots
 ```
 
 #### Matching embedding and assay data COAD + READ
+
 
 ```{r}
 #------------------------------------------
@@ -217,6 +233,10 @@ read_mae <- curatedTCGAData(
 rna_coad <- coad_mae[["COAD_RNASeq2GeneNorm-20160128"]]
 rna_read <- read_mae[["READ_RNASeq2GeneNorm-20160128"]]
 
+```
+
+#### Find common genes
+```{r}
 #------------------------------------------
 # 2. Ensure consistent genes
 #------------------------------------------
@@ -346,24 +366,32 @@ mofa_object <- prepare_mofa(
   training_options = train_opts
 )
 
+
+
+```
+
+```{r}
+#| label: train-mofa-model
+
 # Run/train the model 
 
-mofa_object.trained <- run_mofa(
-  mofa_object,
-  outfile = "mofa_model_crc.hdf5",
-  use_basilisk = TRUE
-)
+#mofa_object.trained <- run_mofa(
+#  mofa_object,
+#  outfile = "mofa_model_crc.hdf5",
+#  use_basilisk = TRUE
+#)
 
 
-plot_data_overview(mofa_object.trained)
 
 ```
 
 #### Analyze MOFA model
 
 ```{r}
-# Load the model
+#| label: load-mofa
+# Load trained MOFA model
 mofa_object.trained <- load_model("mofa_model_crc.hdf5")
+
 
 # Keep only patients in MOFA object
 mofa_samples <- unlist(samples_names(mofa_object.trained))
@@ -374,60 +402,65 @@ metadata_df$sample <- rownames(metadata_df)
 # Now, when we set the samples_metadata, it will have the required 'sample' column.
 samples_metadata(mofa_object.trained) <- metadata_df
 
+# visualize the model
+plot_data_overview(mofa_object.trained)
+
 
 ```
 
 #### Initial visualizations
 
 ```{r}
+#| label: mofa-visualization
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
 
+# Plot variance explained
 plot_variance_explained(mofa_object.trained, plot_total = TRUE)
 
-# For categorical variables like pathology_T_stage
+# Plot factor colored by pathology stage
 plot_factor(mofa_object.trained, 
             factor = 1, 
-            add_violin= T,
+            add_violin = TRUE,
             color_by = "pathology_T_stage")
 
-features_names(mofa_object.trained)
-calculate_variance_explained_per_sample(
-  mofa_object.trained,
-  views = "all",
-  groups = "all",
-  factors = "all"
-)
-
-
+# Plot factor scatter
 plot_factor(mofa_object.trained, 
-            factor = c(1,2), 
+            factor = c(1, 2), 
             color_by = "pathology_T_stage")
 
+# Plot data heatmaps - USE CORRECT VIEW NAMES
 plot_data_heatmap(mofa_object.trained,
                   factor = 1,
-                  view = "RNASeq",
+                  view = "RNASeq",  # This should be correct
                   features = 10,
-                  cluster_rows = F,
-                  cluster_cols = F)
+                  cluster_rows = FALSE,
+                  cluster_cols = FALSE)
 
-
+# Use the actual view name from your model (likely "Embedding_layer0")
 plot_data_heatmap(mofa_object.trained,
                   factor = 1,
-                  view = "Embedding",
+                  view = "Embedding_layer0",  # CORRECTED VIEW NAME
                   features = 10,
-                  cluster_rows = F,
-                  cluster_cols = F)
+                  cluster_rows = FALSE,
+                  cluster_cols = FALSE)
 
-# See which features are most important for each factor
+# Plot top weights - USE CORRECT VIEW NAMES
 plot_top_weights(mofa_object.trained,
                  view = "RNASeq",
                  factor = 1,
                  nfeatures = 10)
 
 plot_top_weights(mofa_object.trained,
-                 view = "Embedding",
+                 view = "Embedding_layer0",  # CORRECTED VIEW NAME
                  factor = 1,
                  nfeatures = 10)
 
+# Plot factor correlations
 plot_factor_cor(mofa_object.trained)
 
 ```
+
+
+
