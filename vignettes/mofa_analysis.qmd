@@ -1,0 +1,355 @@
+---
+title: "mofa_analysis"
+format: html
+editor: visual
+---
+
+```{r}
+library(MOFA2)
+library(survival)
+library(survminer)
+library(curatedTCGAData)
+library(fgsea)
+library(msigdbr)  
+library(enrichplot)
+library(ggplot2)
+library(dplyr)
+library(genekitr)
+
+```
+
+
+
+#### Analyze MOFA model
+
+```{r}
+#| label: load-mofa
+# Load trained MOFA model
+mofa_object.trained <- load_model("mofa_model_crc.hdf5")
+
+#------------------------------------------
+# 1. Get MOFA sample names
+#------------------------------------------
+mofa_samples <- unlist(samples_names(mofa_object.trained))  # vector of sample IDs
+
+#------------------------------------------
+# 2. Subset metadata to match MOFA samples
+#------------------------------------------
+metadata_matched <- metadata_df[mofa_samples, , drop = FALSE]
+
+# Ensure rownames match MOFA sample names exactly
+rownames(metadata_matched) <- mofa_samples
+
+#------------------------------------------
+# 3. Add sample column if needed
+#------------------------------------------
+metadata_matched$sample <- rownames(metadata_matched)
+
+#------------------------------------------
+# 4. Assign metadata to MOFA object
+#------------------------------------------
+samples_metadata(mofa_object.trained) <- metadata_matched
+# visualize the model views and samples
+plot_data_overview(mofa_object.trained)
+
+# Plot factor correlations to check for interdependence issues with the model
+plot_factor_cor(mofa_object.trained)
+
+```
+
+#### Initial visualizations
+
+```{r}
+#| label: mofa-visualization
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+
+# Plot variance explained
+plot_variance_explained(mofa_object.trained, plot_total = TRUE)
+
+
+
+# Plot data heatmaps
+# using rna seq view
+plot_data_heatmap(mofa_object.trained,
+                   scale = "row",
+                   cluster_cols = FALSE,
+                   cluster_rows = FALSE,
+                   show_colnames = FALSE,
+                   denoise = TRUE,
+                   features = 10,
+                   view = "RNASeq",
+                   factor=1)
+
+# Using embedding view
+plot_data_heatmap(mofa_object.trained,
+                  factor = 1,
+                  view = "Embedding_layer0",
+                  features = 10,
+                  cluster_rows = FALSE,
+                  cluster_cols = FALSE,
+                  show_colnames = FALSE)
+
+# Plot top weights 
+plot_top_weights(mofa_object.trained,
+                 view = "RNASeq",
+                 factor = 1,
+                 nfeatures = 10)
+
+
+# Plot factor colored by pathology stage
+plot_factor(mofa_object.trained, 
+            factor = 1, 
+            add_violin = T,
+            dodge = TRUE,
+            color_by = "MYH11")
+
+# Plot factor scatter
+plot_factor(mofa_object.trained, 
+            factor = c(1, 2), 
+            color_by = "pathology_T_stage")
+
+plot_top_weights(mofa_object.trained,
+                 view = "Embedding_layer0",
+                 factor = 1,
+                 nfeatures = 10)
+
+# Correlate factors with clinical variables
+correlate_factors_with_covariates(mofa_object.trained, 
+                      covariates = c("vital_status.x","pathology_M_stage","tumor_tissue_site"), 
+                      plot = "log_pval" )
+
+```
+
+
+#### Surv analysis init
+```{R}
+
+
+# Use the matched metadata already aligned to MOFA
+meta <- metadata_matched
+
+# Compute survival time (days)
+meta$time <- ifelse(meta$vital_status.x == 1,  # 1 = deceased
+                    meta$patient.days_to_last_followup,
+                    meta$patient.days_to_last_known_alive)
+
+
+# Check NA counts
+sapply(meta[, c("days_to_death.x", 
+                "patient.days_to_last_followup", 
+                "patient.days_to_last_known_alive")], 
+       function(x) sum(is.na(x)))
+names(meta)
+
+
+# Ensure non-negative times
+meta$time <- pmax(meta$time, 0)
+
+# Event indicator: 1 = death, 0 = censored
+meta$event <- meta$vital_status.x  # already numeric 1=death, 0=censored
+names(meta)
+# Diagnostics
+cat("Event counts:\n"); print(table(meta$event, useNA="ifany"))
+summary(meta$time)
+meta$gender
+# --------------------------
+# 1. KM by histological type
+# --------------------------
+km_fit_hist <- survfit(Surv(time, event) ~ patient.gender ,
+                       data = meta)
+
+ggsurvplot(
+  km_fit_hist,
+  data = meta,
+  risk.table = TRUE,
+  pval = TRUE,
+  palette = "Dark2",
+  title = "Kaplan-Meier Survival by Histological Type",
+  xlab = "Days",
+  ylab = "Survival Probability"
+)
+
+# --------------------------
+# 2. surv by MOFA Factor1
+# --------------------------
+
+# -------------------------------
+# Extract MOFA factors and align with metadata
+# -------------------------------
+fmat <- get_factors(mofa_object.trained, factors = "all", as.data.frame = FALSE)[[1]]
+
+# Keep only common samples between MOFA factors and metadata
+common_samples <- intersect(rownames(meta), rownames(fmat))
+cat("Common samples between metadata and MOFA factors:", length(common_samples), "\n")
+
+meta2 <- meta[common_samples, , drop = FALSE]
+fmat2 <- fmat[common_samples, , drop = FALSE]
+
+# Attach Factor1 as numeric
+meta2$factor1 <- as.numeric(fmat2[, 1])
+
+# -------------------------------
+# Subset to usable samples
+# -------------------------------
+meta_use <- meta2 %>% filter(!is.na(time) & !is.na(event))
+cat("Usable samples after filtering:", nrow(meta_use), "\n")
+
+# -------------------------------
+# Create survival object
+# -------------------------------
+surv_obj <- Surv(time = meta_use$time, event = meta_use$event)
+
+# Fit survival model using Factor1 as continuous variable
+cox_fit <- coxph(surv_obj ~ factor1, data = meta_use)
+summary(cox_fit)
+
+```
+
+
+
+#### Fast preranked gene set enrichment analysis (GSEA)
+
+```{r}
+# Extract weights for Factor 1 in RNASeq
+weights <- get_weights(mofa_object.trained, 
+                       views = "RNASeq", 
+                       factors = 1, 
+                       as.data.frame = TRUE)
+
+names(weights)
+# Make named vector of weights
+ranks <- weights$value
+names(ranks) <- weights$feature
+
+# Order decreasing (important!)
+ranks <- sort(ranks, decreasing = TRUE)
+
+# get Hallmark gene sets
+pathways <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Run preranked GSEA
+fgseaRes <- fgsea(pathways = pathways,
+                  stats    = ranks,
+                  minSize  = 15,
+                  maxSize  = 500)
+
+# Show top pathways
+fgseaRes[order(fgseaRes$pval), ][1:10, ]
+
+```
+
+
+# Testing out genSEA
+```{r}
+# Make a named vector of weights
+ranks <- weights$value
+names(ranks) <- weights$feature
+
+# Order the vector in decreasing order (this is crucial for GSEA)
+ranks <- sort(ranks, decreasing = TRUE)
+
+# --- Step 2: Prepare the Hallmark gene sets for genGSEA ---
+# This is the corrected step. You must include the `gs_description` column.
+
+pathways_for_gensea <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  select(gs_name, gene_symbol, gs_description) %>%
+  rename(term = gs_name, gene = gene_symbol)
+
+# --- Step 3: Run the GSEA analysis using genGSEA() ---
+
+# Run the analysis using the ranked list and the formatted gene sets
+gensea_results <- genGSEA(
+  genelist = ranks,
+  geneset = pathways_for_gensea,
+  min_gset_size = 15,
+  max_gset_size = 500
+)
+
+```
+
+
+
+
+#### Visualize fGSEA
+
+* barplot
+
+```{r}
+
+ggplot(fgseaResTidy, aes(x = pathway, y = NES)) +
+  geom_col(aes(fill = padj < 0.05)) +
+  coord_flip() +
+  labs(
+    x = "Pathway",
+    y = "Normalized Enrichment Score (NES)",
+    title = "Hallmark Pathways from GSEA",
+    fill = "FDR < 0.05"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 10)
+  )
+
+
+```
+
+
+* dotplot
+
+```{r}
+
+# Dotplot
+ggplot(fgseaResTidy, aes(x = NES, y = pathway)) +
+  geom_point(aes(size = size, color = -log10(padj))) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(
+    x = "Normalized Enrichment Score (NES)",
+    y = "Pathway",
+    title = "Hallmark Pathways Enriched (GSEA)",
+    size = "Gene Set Size",
+    color = "-log10(FDR q-value)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+* gsea table
+```{r}
+
+# Generates a clean table for reporting
+plotGseaTable(
+  fgseaRes = fgseaResTidy,
+  stats = ranks,     # your MOFA factor loadings
+  pathways = pathways
+)
+
+
+```
+
+
+* Plotting the top path
+
+```{r}
+# Picking the top path (MYC targets V1)
+top_path <- fgseaResTidy$pathway[1]
+
+plotEnrichment(pathways[[top_path]], ranks) +
+  labs(title = paste("Enrichment Curve:", top_path))
+
+
+
+```
+
+
+
+
+
+
+
