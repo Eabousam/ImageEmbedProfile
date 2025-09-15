@@ -46,7 +46,6 @@ library(rmarkdown)
 library(knitr)
 library(psych)
 
-
 ```
 
 #### prov-gigaPath COAD
@@ -233,6 +232,8 @@ read_mae <- curatedTCGAData(
 rna_coad <- coad_mae[["COAD_RNASeq2GeneNorm-20160128"]]
 rna_read <- read_mae[["READ_RNASeq2GeneNorm-20160128"]]
 
+colData(coad_mae)
+
 ```
 
 #### Find common genes
@@ -259,47 +260,51 @@ embedding_patients <- sapply(strsplit(rownames(tensor_matrix_unique), "-"), func
 rownames(tensor_matrix_unique) <- make.unique(embedding_patients)
 
 #------------------------------------------
-# 4. Prepare clinical metadata
+# 4. Prepare clinical metadata while keeping survival vars
 #------------------------------------------
-# Subset COAD clinical metadata
-coad_clinical <- colData(coad_mae)
-completeness <- colSums(!is.na(coad_clinical)) / nrow(coad_clinical) * 100
-coad_clinical_sub <- coad_clinical[, which(completeness > 95)] %>%
-  as.data.frame() %>%
-  select(-matches("aliquot"), -matches("portion"))
 
-# Subset READ clinical metadata
-read_clinical <- colData(read_mae)
-completeness <- colSums(!is.na(read_clinical)) / nrow(read_clinical) * 100
-read_clinical_sub <- read_clinical[, which(completeness > 95)] %>%
-  as.data.frame() %>%
-  select(-matches("aliquot"), -matches("portion"))
+# Subset COAD clinical metadata
+coad_clinical <- colData(coad_mae) %>% as.data.frame()
+read_clinical <- colData(read_mae) %>% as.data.frame()
+
+# Define survival variables to keep regardless of completeness
+surv_vars <- c("vital_status.x", "days_to_death.x", 
+               "patient.days_to_last_followup", "patient.days_to_last_known_alive")
+
+# Calculate completeness for all columns
+coad_completeness <- colSums(!is.na(coad_clinical)) / nrow(coad_clinical) * 100
+read_completeness <- colSums(!is.na(read_clinical)) / nrow(read_clinical) * 100
+
+# Keep columns >95% complete OR survival variables
+coad_clinical_sub <- coad_clinical[, coad_completeness > 95 | colnames(coad_clinical) %in% surv_vars]
+read_clinical_sub <- read_clinical[, read_completeness > 95 | colnames(read_clinical) %in% surv_vars]
+
+# Remove aliquot/portion columns
+coad_clinical_sub <- coad_clinical_sub %>% select(-matches("aliquot"), -matches("portion"))
+read_clinical_sub <- read_clinical_sub %>% select(-matches("aliquot"), -matches("portion"))
 
 # Ensure all columns exist in both datasets
 all_cols <- union(colnames(coad_clinical_sub), colnames(read_clinical_sub))
+for (col in setdiff(all_cols, colnames(coad_clinical_sub))) coad_clinical_sub[[col]] <- NA
+for (col in setdiff(all_cols, colnames(read_clinical_sub))) read_clinical_sub[[col]] <- NA
 
-# Fill missing columns with NA
-coad_clinical_full <- coad_clinical_sub
-for (col in setdiff(all_cols, colnames(coad_clinical_sub))) coad_clinical_full[[col]] <- NA
-
-read_clinical_full <- read_clinical_sub
-for (col in setdiff(all_cols, colnames(read_clinical_sub))) read_clinical_full[[col]] <- NA
-
-# Merge COAD + READ clinical metadata
-clinical_sub <- rbind(coad_clinical_full, read_clinical_full)
+# Merge COAD + READ metadata
+clinical_sub <- rbind(coad_clinical_sub, read_clinical_sub)
 
 # Keep only patients with embeddings
 patients_with_embed <- rownames(tensor_matrix_unique)
 clinical_sub <- clinical_sub[rownames(clinical_sub) %in% patients_with_embed, ]
 
-# Factorize categorical variables with 2–10 levels
-numLv <- apply(clinical_sub, 2, function(x) length(unique(x)))
+# Factorize categorical variables with 2–10 levels, excluding survival vars
+cat_vars <- setdiff(names(clinical_sub), surv_vars)
+numLv <- sapply(clinical_sub[, cat_vars, drop = FALSE], function(x) length(unique(x)))
 slideAttrNames <- names(numLv[numLv >= 2 & numLv <= 10])
 for (slideAttrName in slideAttrNames) {
   clinical_sub[[slideAttrName]] <- as.factor(clinical_sub[[slideAttrName]])
 }
 
-metadata_df <- clinical_sub[slideAttrNames]
+# Combine factorized categorical variables with survival vars
+metadata_df <- clinical_sub[, c(slideAttrNames, surv_vars)]
 
 #------------------------------------------
 # 5. Subset RNASeq to patients with embeddings
@@ -322,10 +327,20 @@ rna_se <- SummarizedExperiment(
   colData = DataFrame(patientID = colnames(rna_matched_clean))
 )
 
+# Embedding summarised exp
+
+# Subset metadata for patients with embeddings
+metadata_matched <- metadata_df[colnames(rna_matched_clean), , drop = FALSE]
+
+# Fix rownames to match assay columns exactly
+rownames(metadata_matched) <- colnames(rna_matched_clean)
+
+# Create SummarizedExperiment
 embedding_se <- SummarizedExperiment(
   assays = list(embedding = t(embedding_matched_clean)),
-  colData = metadata_df[colnames(rna_matched_clean), , drop = FALSE]
+  colData = metadata_matched
 )
+
 rownames(embedding_se) <- paste0("embed_", seq_len(nrow(embedding_se)))
 
 #------------------------------------------
@@ -382,85 +397,40 @@ mofa_object <- prepare_mofa(
 #)
 
 
-
-```
-
-#### Analyze MOFA model
-
-```{r}
-#| label: load-mofa
 # Load trained MOFA model
 mofa_object.trained <- load_model("mofa_model_crc.hdf5")
 
+#------------------------------------------
+# 1. Get MOFA sample names
+#------------------------------------------
+mofa_samples <- unlist(samples_names(mofa_object.trained))  # vector of sample IDs
 
-# Keep only patients in MOFA object
-mofa_samples <- unlist(samples_names(mofa_object.trained))
+#------------------------------------------
+# 2. Subset metadata to match MOFA samples
+#------------------------------------------
 metadata_matched <- metadata_df[mofa_samples, , drop = FALSE]
-# For the metadata data frame that we want to add to the MOFA object:
-metadata_df$sample <- rownames(metadata_df)
 
-# Now, when we set the samples_metadata, it will have the required 'sample' column.
-samples_metadata(mofa_object.trained) <- metadata_df
+# Ensure rownames match MOFA sample names exactly
+rownames(metadata_matched) <- mofa_samples
 
-# visualize the model
-plot_data_overview(mofa_object.trained)
+#------------------------------------------
+# 3. Add sample column if needed
+#------------------------------------------
+metadata_matched$sample <- rownames(metadata_matched)
+
+#------------------------------------------
+# 4. Assign metadata to MOFA object
+#------------------------------------------
+samples_metadata(mofa_object.trained) <- metadata_matched
+
+# Save the updated object (RDS is easiest)
+saveRDS(mofa_object.trained, file = "mofa_model_with_metadata.rds")
 
 
-```
 
-#### Initial visualizations
-
-```{r}
-#| label: mofa-visualization
-#| warning: false
-#| fig-width: 10
-#| fig-height: 8
-
-# Plot variance explained
-plot_variance_explained(mofa_object.trained, plot_total = TRUE)
-
-# Plot factor colored by pathology stage
-plot_factor(mofa_object.trained, 
-            factor = 1, 
-            add_violin = TRUE,
-            color_by = "pathology_T_stage")
-
-# Plot factor scatter
-plot_factor(mofa_object.trained, 
-            factor = c(1, 2), 
-            color_by = "pathology_T_stage")
-
-# Plot data heatmaps - USE CORRECT VIEW NAMES
-plot_data_heatmap(mofa_object.trained,
-                  factor = 1,
-                  view = "RNASeq",  # This should be correct
-                  features = 10,
-                  cluster_rows = FALSE,
-                  cluster_cols = FALSE)
-
-# Use the actual view name from your model (likely "Embedding_layer0")
-plot_data_heatmap(mofa_object.trained,
-                  factor = 1,
-                  view = "Embedding_layer0",  # CORRECTED VIEW NAME
-                  features = 10,
-                  cluster_rows = FALSE,
-                  cluster_cols = FALSE)
-
-# Plot top weights - USE CORRECT VIEW NAMES
-plot_top_weights(mofa_object.trained,
-                 view = "RNASeq",
-                 factor = 1,
-                 nfeatures = 10)
-
-plot_top_weights(mofa_object.trained,
-                 view = "Embedding_layer0",  # CORRECTED VIEW NAME
-                 factor = 1,
-                 nfeatures = 10)
-
-# Plot factor correlations
-plot_factor_cor(mofa_object.trained)
 
 ```
+
 
 
 

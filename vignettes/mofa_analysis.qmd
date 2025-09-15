@@ -1,10 +1,26 @@
 ---
-title: "mofa_analysis"
-format: html
+title: "Multi-Omics Factor Analysis (MOFA) & preranked Gene Enrichment (GSEA) Cancer Imaging"
+format: 
+  html:
+    theme: yeti
+    highlight-style: tango
+    toc: true
+    toc-depth: 3
+    toc-floating: true
 editor: visual
+execute:
+  echo: false
+  warning: false
+  message: false
+  include: false
+  results: "hide"
+  fig-width: 10
+  fig-height: 8
+  fig-dpi: 300
 ---
 
-```{r}
+```{r setup, include=FALSE}
+# Load required libraries
 library(MOFA2)
 library(survival)
 library(survminer)
@@ -22,38 +38,19 @@ library(genekitr)
 
 #### Analyze MOFA model
 
-```{r}
+```{r, include =TRUE, echo = TRUE}
 #| label: load-mofa
 # Load trained MOFA model
-mofa_object.trained <- load_model("mofa_model_crc.hdf5")
 
-#------------------------------------------
-# 1. Get MOFA sample names
-#------------------------------------------
-mofa_samples <- unlist(samples_names(mofa_object.trained))  # vector of sample IDs
-
-#------------------------------------------
-# 2. Subset metadata to match MOFA samples
-#------------------------------------------
-metadata_matched <- metadata_df[mofa_samples, , drop = FALSE]
-
-# Ensure rownames match MOFA sample names exactly
-rownames(metadata_matched) <- mofa_samples
-
-#------------------------------------------
-# 3. Add sample column if needed
-#------------------------------------------
-metadata_matched$sample <- rownames(metadata_matched)
-
-#------------------------------------------
-# 4. Assign metadata to MOFA object
-#------------------------------------------
-samples_metadata(mofa_object.trained) <- metadata_matched
+mofa_object.trained <- readRDS("mofa_model_with_metadata.rds")
 # visualize the model views and samples
 plot_data_overview(mofa_object.trained)
 
 # Plot factor correlations to check for interdependence issues with the model
 plot_factor_cor(mofa_object.trained)
+
+
+
 
 ```
 
@@ -62,8 +59,7 @@ plot_factor_cor(mofa_object.trained)
 ```{r}
 #| label: mofa-visualization
 #| warning: false
-#| fig-width: 10
-#| fig-height: 8
+
 
 # Plot variance explained
 plot_variance_explained(mofa_object.trained, plot_total = TRUE)
@@ -124,11 +120,19 @@ correlate_factors_with_covariates(mofa_object.trained,
 
 
 #### Surv analysis init
-```{R}
+
+* The clinical features have 5 dimensions: T stage, N stage, M stage, total stage, and whether or not to receive chemotherapy after surgery [1]
+
+[1] Cai, C., Zhou, Y., Jiao, Y. et al. Prognostic Analysis Combining Histopathological Features and Clinical Information to Predict Colorectal Cancer Survival from Whole-Slide Images. Dig Dis Sci 69, 2985–2995 (2024). https://doi-org.ccny-proxy1.libr.ccny.cuny.edu/10.1007/s10620-024-08501-x
+
+
+
+
+```{r, include=TRUE, echo=TRUE}
 
 
 # Use the matched metadata already aligned to MOFA
-meta <- metadata_matched
+meta <- samples_metadata(mofa_object.trained)
 
 # Compute survival time (days)
 meta$time <- ifelse(meta$vital_status.x == 1,  # 1 = deceased
@@ -149,15 +153,13 @@ meta$time <- pmax(meta$time, 0)
 
 # Event indicator: 1 = death, 0 = censored
 meta$event <- meta$vital_status.x  # already numeric 1=death, 0=censored
-names(meta)
 # Diagnostics
 cat("Event counts:\n"); print(table(meta$event, useNA="ifany"))
-summary(meta$time)
-meta$gender
+
 # --------------------------
 # 1. KM by histological type
 # --------------------------
-km_fit_hist <- survfit(Surv(time, event) ~ patient.gender ,
+km_fit_hist <- survfit(Surv(time, event) ~ pathology_M_stage  ,
                        data = meta)
 
 ggsurvplot(
@@ -166,7 +168,7 @@ ggsurvplot(
   risk.table = TRUE,
   pval = TRUE,
   palette = "Dark2",
-  title = "Kaplan-Meier Survival by Histological Type",
+  title = "Kaplan-Meier Survival by Gender",
   xlab = "Days",
   ylab = "Survival Probability"
 )
@@ -211,27 +213,49 @@ summary(cox_fit)
 
 #### Fast preranked gene set enrichment analysis (GSEA)
 
-```{r}
+```{r, GSEA, include=TRUE, echo=TRUE}
 # Extract weights for Factor 1 in RNASeq
+# we extracted the feature weights for the top contributing genes in the rnaseq view, which represent the genes most associated with factor 1
 weights <- get_weights(mofa_object.trained, 
                        views = "RNASeq", 
                        factors = 1, 
                        as.data.frame = TRUE)
 
-names(weights)
 # Make named vector of weights
 ranks <- weights$value
 names(ranks) <- weights$feature
 
-# Order decreasing (important!)
+# Order decreasing
 ranks <- sort(ranks, decreasing = TRUE)
 
 # get Hallmark gene sets
-pathways <- msigdbr(species = "Homo sapiens", category = "H") %>%
+#50 curated gene sets representing broad, well-defined biological processes (e.g., MYC targets, E2F targets, KRAS signaling, apoptosis)
+pathways_hallmark <- msigdbr(species = "Homo sapiens", category = "H") %>%
   split(x = .$gene_symbol, f = .$gs_name)
 
+# get c2 gene sets
+# Gene sets representing signatures of oncogene activation or inactivation (e.g., KRAS, MYC, E2F, PTEN loss).
+pathways_c6 <- msigdbr(species = "Homo sapiens", category = "C6") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# get c2 gene sets
+#Pathway databases and expert-curated gene sets, subdivided into:
+##CGP (chemical/genetic perturbations) → genes responsive to drugs or perturbations.
+##CP (canonical pathways) → pathways from KEGG, Reactome, BioCarta.
+pathways_c2 <- msigdbr(species = "Homo sapiens", category = "C2") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+
+```
+
+
+
+## Run FGSEA
+```{r}
+
 # Run preranked GSEA
-fgseaRes <- fgsea(pathways = pathways,
+#gene set enrichment analysis (GSEA) to identify biological pathways and programs associated with the latent factors
+fgseaRes <- fgsea(pathways = pathways_c6,
                   stats    = ranks,
                   minSize  = 15,
                   maxSize  = 500)
@@ -239,34 +263,49 @@ fgseaRes <- fgsea(pathways = pathways,
 # Show top pathways
 fgseaRes[order(fgseaRes$pval), ][1:10, ]
 
+# Arrange the output
+fgseaResTidy <- fgseaRes %>%
+  arrange(NES) %>%
+  mutate(pathway = factor(pathway, levels = rev(unique(pathway))))
+
 ```
 
+**Explanation of GSEA output (fgsea):**
 
-# Testing out genSEA
+- **pathway** – Name of the gene set tested (e.g., Hallmark pathways).  
+- **pval** – Raw p-value from the enrichment test.  
+- **padj** – Adjusted p-value (FDR corrected).  
+- **ES (Enrichment Score)** – Degree to which a gene set is overrepresented at the top or bottom of the ranked list.  
+- **NES (Normalized Enrichment Score)** – Enrichment score normalized for gene set size, used to compare across gene sets.  
+- **size** – Number of genes in the pathway that overlap with the ranked list.  
+- **leadingEdge** – Subset of genes that contribute most to the enrichment signal. 
+
+
 ```{r}
-# Make a named vector of weights
-ranks <- weights$value
-names(ranks) <- weights$feature
-
-# Order the vector in decreasing order (this is crucial for GSEA)
-ranks <- sort(ranks, decreasing = TRUE)
-
-# --- Step 2: Prepare the Hallmark gene sets for genGSEA ---
-# This is the corrected step. You must include the `gs_description` column.
-
-pathways_for_gensea <- msigdbr(species = "Homo sapiens", category = "H") %>%
-  select(gs_name, gene_symbol, gs_description) %>%
-  rename(term = gs_name, gene = gene_symbol)
-
-# --- Step 3: Run the GSEA analysis using genGSEA() ---
-
-# Run the analysis using the ranked list and the formatted gene sets
-gensea_results <- genGSEA(
-  genelist = ranks,
-  geneset = pathways_for_gensea,
-  min_gset_size = 15,
-  max_gset_size = 500
-)
+# Testing out genSEA
+# # Make a named vector of weights
+# ranks <- weights$value
+# names(ranks) <- weights$feature
+# 
+# # Order the vector in decreasing order (this is crucial for GSEA)
+# ranks <- sort(ranks, decreasing = TRUE)
+# 
+# # --- Step 2: Prepare the Hallmark gene sets for genGSEA ---
+# # This is the corrected step. You must include the `gs_description` column.
+# 
+# pathways_for_gensea <- msigdbr(species = "Homo sapiens", category = "H") %>%
+#   select(gs_name, gene_symbol, gs_description) %>%
+#   rename(term = gs_name, gene = gene_symbol)
+# 
+# # --- Step 3: Run the GSEA analysis using genGSEA() ---
+# 
+# # Run the analysis using the ranked list and the formatted gene sets
+# gensea_results <- genGSEA(
+#   genelist = ranks,
+#   geneset = pathways_for_gensea,
+#   min_gset_size = 15,
+#   max_gset_size = 500
+# )
 
 ```
 
@@ -275,9 +314,24 @@ gensea_results <- genGSEA(
 
 #### Visualize fGSEA
 
+
+* gsea table
+```{r, include=TRUE}
+
+# Generates a clean table for reporting
+plotGseaTable(
+  fgseaRes = fgseaResTidy,
+  stats = ranks,     # your MOFA factor loadings
+  pathways = pathways
+)
+
+
+```
+
+
 * barplot
 
-```{r}
+```{r, include=TRUE}
 
 ggplot(fgseaResTidy, aes(x = pathway, y = NES)) +
   geom_col(aes(fill = padj < 0.05)) +
@@ -297,10 +351,16 @@ ggplot(fgseaResTidy, aes(x = pathway, y = NES)) +
 
 ```
 
+- Hallmark pathways from the GSEA results, ranked by normalized enrichment score (NES), with bars colored by whether the adjusted p-value (FDR) is significant (< 0.05).
+
+- MYC targets (V1, V2), E2F targets, and KRAS signaling are strongly negatively enriched, suggesting suppression of cell-cycle–related and oncogenic signaling programs in the context of the factors identified by MOFA. 
+
+- epithelial–mesenchymal transition (EMT), inflammatory response, interferon gamma response, and allograft rejection. This points to activation of immune and stromal programs.
+
 
 * dotplot
 
-```{r}
+```{r, include=TRUE}
 
 # Dotplot
 ggplot(fgseaResTidy, aes(x = NES, y = pathway)) +
@@ -320,23 +380,12 @@ ggplot(fgseaResTidy, aes(x = NES, y = pathway)) +
   )
 ```
 
-* gsea table
-```{r}
 
-# Generates a clean table for reporting
-plotGseaTable(
-  fgseaRes = fgseaResTidy,
-  stats = ranks,     # your MOFA factor loadings
-  pathways = pathways
-)
-
-
-```
 
 
 * Plotting the top path
 
-```{r}
+```{r, include=TRUE}
 # Picking the top path (MYC targets V1)
 top_path <- fgseaResTidy$pathway[1]
 
