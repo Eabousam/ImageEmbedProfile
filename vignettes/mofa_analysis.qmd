@@ -17,8 +17,12 @@ execute:
   fig-width: 10
   fig-height: 8
   fig-dpi: 300
+editor_options: 
+  chunk_output_type: inline
 ---
 
+
+## Libraries 
 ```{r setup, include=FALSE}
 # Load required libraries
 library(MOFA2)
@@ -34,6 +38,7 @@ library(genekitr)
 library(GSVA)
 library(Hmisc)
 library(pheatmap)
+library(DT)
 devtools::load_all()
 
 ```
@@ -154,6 +159,8 @@ pathways_c2 <- msigdbr(species = "Homo sapiens", collection = "C2") %>%
   split(x = .$gene_symbol, f = .$gs_name)
 
 
+
+
 ```
 
 
@@ -214,14 +221,6 @@ factor_interpretation$Factor1$hallmark_top
 - **NES (Normalized Enrichment Score)** – Enrichment score normalized for gene set size, used to compare across gene sets.  
 - **size** – Number of genes in the pathway that overlap with the ranked list.  
 - **leadingEdge** – Subset of genes that contribute most to the enrichment signal. 
-
-
-
-
-
-#### fGSEA table
-
-
 
 
 - Hallmark pathways from the GSEA results, ranked by normalized enrichment score (NES), with bars colored by whether the adjusted p-value (FDR) is significant (< 0.05).
@@ -288,7 +287,7 @@ c2_cor <- correlate_factors_pathways(fmat, ssgsea_c2, "C2")
 c6_cor <- correlate_factors_pathways(fmat, ssgsea_c6, "C6")
 
 # Find top correlated pathways for each factor
-interpret_factors <- function(cor_matrix, pathways, n_top = 10) {
+interpret_factors <- function(cor_matrix, pathways, n_top = 20) {
   factor_interpretations <- list()
   
   for(i in 1:nrow(cor_matrix)) {
@@ -325,30 +324,61 @@ c6_interpret <- interpret_factors(c6_cor, pathways_c6)
 ## geom_col plot
 
 ```{r}
-# -------------------------
-# 3. Combine GSEA + GSVA side by side
-# -------------------------
-plot_factor_sidebyside <- function(factor_id, gsea_collection = "hallmark", gsva_collection = "hallmark", n_pathways = 5) {
-  p_gsea <- plot_gsea(factor_id, gsea_collection, n_pathways)
-  p_gsva <- plot_gsva(factor_id, gsva_collection, n_pathways)
+## geom_col plot
+
+# Function to return individual plots
+plot_factor_separate <- function(factor_id,
+                                 gsea_collection = "hallmark",
+                                 gsva_collection = "hallmark",
+                                 max_pathways = 10) {
   
-  if (is.null(p_gsea) & is.null(p_gsva)) return(NULL)
+  plots <- list()
   
-  combined <- p_gsea + p_gsva + plot_layout(ncol = 2)
-  return(combined)
+  # --- GSEA ---
+  p_gsea <- plot_gsea(factor_id, gsea_collection, max_pathways)
+  if (!is.null(p_gsea)) {
+    p_gsea <- p_gsea +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 9, hjust = 1),
+        axis.title = element_blank(),
+        plot.margin = margin(5, 10, 5, 50)
+      ) +
+      ggtitle(paste("Factor:", factor_id, "- GSEA"))
+  } else {
+    p_gsea <- ggplot() + theme_void() + ggtitle(paste(factor_id, "GSEA missing"))
+  }
+  plots[["GSEA"]] <- p_gsea
+  
+  # --- GSVA ---
+  p_gsva <- plot_gsva(factor_id, gsva_collection, max_pathways)
+  if (!is.null(p_gsva)) {
+    p_gsva <- p_gsva +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 4, hjust = 1),
+        axis.title = element_blank(),
+        plot.margin = margin(5, 10, 5, 50)
+      ) +
+      ggtitle(paste("Factor:", factor_id, "- GSVA"))
+  } else {
+    p_gsva <- ggplot() + theme_void() + ggtitle(paste(factor_id, "GSVA missing"))
+  }
+  plots[["GSVA"]] <- p_gsva
+  
+  return(plots)
 }
 
-
+# Factors to plot
 top_factors <- c("Factor1", "Factor2", "Factor3")
 
-plots_list <- lapply(top_factors, function(f) {
-  plot_factor_sidebyside(f, gsea_collection = "c2", gsva_collection = "c2", n_pathways = 2)
-})
-
-plots_list <- Filter(Negate(is.null), plots_list)  # remove NULLs
-
-wrap_plots(plots_list, ncol = 1) +
-  plot_annotation(title = "MOFA Factor Interpretation (GSEA vs GSVA)")
+# Generate and print each plot separately
+for (f in top_factors) {
+  plots <- plot_factor_separate(f, gsea_collection = "c2", gsva_collection = "c2", max_pathways = 8)
+  
+  print(plots[["GSEA"]])
+  print(plots[["GSVA"]])
+}
 ```
 
 
@@ -365,14 +395,343 @@ plot_gsea_heatmap("hallmark", top_n_pathways = 30)
 plot_gsva_heatmap("hallmark", top_n_pathways = 20)
 
 # You can switch to "c2" or "c6"
-plot_gsea_heatmap("c2", top_n_pathways = 15)
-plot_gsva_heatmap("c2", top_n_pathways = 15)
+plot_gsea_heatmap("c2", top_n_pathways = 20)
+plot_gsva_heatmap("c2", top_n_pathways = 20)
 
 
 
 ```
 
 
+# Table
+
+```{r}
+# ---- Integrated interpret_factor function ----
+interpret_factor <- function(factor_id,
+                             top_n_pathways = 5,
+                             top_n_genes = 10,
+                             gsva_collections = c("hallmark","c2","c6"),
+                             gsea_collections = c("hallmark","c2","c6")) {
+  
+  # --- Top genes ---
+  all_weights <- get_weights(mofa_object.trained, views="RNASeq", factors=factor_id, as.data.frame=TRUE)
+  top_genes <- head(all_weights[order(-abs(all_weights$value)), ], top_n_genes)
+  
+  # --- FGSEA ---
+  gsea_summary <- list()
+  ranks <- setNames(all_weights$value, all_weights$feature)
+  ranks <- sort(ranks, decreasing = TRUE)
+  
+  if("hallmark" %in% gsea_collections) {
+    res <- fgsea(pathways_hallmark, ranks, minSize=15, maxSize=500)
+    gsea_summary$hallmark <- if(nrow(res) > 0) res[order(res$pval), ][1:top_n_pathways, ] else NULL
+  }
+  if("c2" %in% gsea_collections) {
+    res <- fgsea(pathways_c2, ranks, minSize=15, maxSize=500)
+    gsea_summary$c2 <- if(nrow(res) > 0) res[order(res$pval), ][1:top_n_pathways, ] else NULL
+  }
+  if("c6" %in% gsea_collections) {
+    res <- fgsea(pathways_c6, ranks, minSize=15, maxSize=500)
+    gsea_summary$c6 <- if(nrow(res) > 0) res[order(res$pval), ][1:top_n_pathways, ] else NULL
+  }
+  
+  # --- GSVA correlations ---
+  gsva_summary <- list()
+  if("hallmark" %in% gsva_collections) gsva_summary$hallmark <- hallmark_interpret[[factor_id]]
+  if("c2" %in% gsva_collections)       gsva_summary$c2 <- c2_interpret[[factor_id]]
+  if("c6" %in% gsva_collections)       gsva_summary$c6 <- c6_interpret[[factor_id]]
+  
+  list(
+    top_genes = top_genes,
+    gsea_summary = gsea_summary,
+    gsva_summary = gsva_summary
+  )
+}
+
+create_summary_table <- function(factor_ids = paste0("Factor", 1:10),
+                                 top_n_pathways = 5,
+                                 top_n_genes = 10,
+                                 interpretations = NULL) {
+  
+  # Pre-define all possible columns to ensure consistency
+  all_gsea_cols <- c("Top_HALLMARK_GSEA_Pathways", "Top_C2_GSEA_Pathways", "Top_C6_GSEA_Pathways")
+  all_gsva_cols <- c("Top_HALLMARK_GSVA_Pathways", "Top_C2_GSVA_Pathways", "Top_C6_GSVA_Pathways")
+  
+  reports <- lapply(factor_ids, function(fid) {
+    
+    # ---- Get interpretation outputs ----
+    out <- interpret_factor(fid,
+                            top_n_pathways = top_n_pathways,
+                            top_n_genes = top_n_genes)
+    
+    # ---- Top genes ----
+    top_genes_text <- NA
+    if(!is.null(out$top_genes) && nrow(out$top_genes) > 0) {
+      top_genes_vec <- as.character(out$top_genes$feature)
+      if(is.list(top_genes_vec)) top_genes_vec <- unlist(top_genes_vec)
+      top_genes_text <- paste(head(top_genes_vec, top_n_genes), collapse = ", ")
+    }
+    
+    # ---- GSEA columns ----
+    gsea_cols <- setNames(rep(NA, length(all_gsea_cols)), all_gsea_cols)
+    
+    for(col in names(out$gsea_summary)) {
+      col_name <- paste0("Top_", toupper(col), "_GSEA_Pathways")
+      res <- out$gsea_summary[[col]]
+      if(!is.null(res) && nrow(res) > 0) {
+        res <- res[order(res$pval), , drop = FALSE]
+        res <- head(res, min(top_n_pathways, nrow(res)))
+        gsea_cols[col_name] <- paste(res$pathway, "(p=", signif(res$pval, 2), ")", collapse = "; ")
+      }
+    }
+    
+    # ---- GSVA columns ----
+    gsva_cols <- setNames(rep(NA, length(all_gsva_cols)), all_gsva_cols)
+    
+    for(col in names(out$gsva_summary)) {
+      col_name <- paste0("Top_", toupper(col), "_GSVA_Pathways")
+      cor_vec <- out$gsva_summary[[col]]
+      if(!is.null(cor_vec) && length(cor_vec) > 0) {
+        # Ensure we have a named numeric vector
+        if(is.data.frame(cor_vec)) {
+          if(ncol(cor_vec) == 1) {
+            cor_vec <- setNames(cor_vec[,1], rownames(cor_vec))
+          } else {
+            cor_vec <- setNames(cor_vec[,1], rownames(cor_vec)) # Take first column
+          }
+        }
+        if(is.list(cor_vec)) cor_vec <- unlist(cor_vec)
+        
+        # Get top correlations
+        if(length(cor_vec) > 0 && !is.null(names(cor_vec))) {
+          top_cor <- head(sort(cor_vec, decreasing = TRUE), top_n_pathways)
+          gsva_cols[col_name] <- paste(names(top_cor), "[cor=", signif(top_cor, 2), "]", collapse = "; ")
+        }
+      }
+    }
+    
+    # ---- Combine all into one row ----
+    result_row <- data.frame(
+      Factor = fid,
+      Top_Genes = top_genes_text,
+      Interpretation = if(!is.null(interpretations) && fid %in% names(interpretations)) interpretations[[fid]] else NA,
+      stringsAsFactors = FALSE
+    )
+    
+    # Add GSEA and GSVA columns in consistent order
+    for(col_name in all_gsea_cols) {
+      result_row[[col_name]] <- gsea_cols[col_name]
+    }
+    for(col_name in all_gsva_cols) {
+      result_row[[col_name]] <- gsva_cols[col_name]
+    }
+    
+    return(result_row)
+  })
+  
+  # Combine all rows
+  final_table <- do.call(rbind, reports)
+  return(final_table)
+}
+
+
+# Add the interpretation based on the table
+interpretations <- list(
+  Factor1 = "Oncogenic proliferation program characterized by MYC/E2F-driven cell cycle activity, KRAS/TGF-β signaling, and smooth muscle/stromal gene expression (MYH11, DES, CNN1)",
+  
+  Factor2 = "oxidative stress response with immune activation features (allograft rejection, interferon signaling) and angiogenesis regulation",
+  
+  Factor3 = "Metabolic reprogramming program centered on oxidative phosphorylation and myogenesis, with epithelial-mesenchymal transition and coagulation pathway activation",
+  
+  Factor4 = "Mitotic and metabolic axis featuring spindle assembly, oxidative phosphorylation, and adipogenesis, with strong autophagy and amino acid metabolism components",
+  
+  Factor5 = "Advanced cancer progression signature with strong EMT, fatty acid metabolism, and matrisome remodeling, indicative of invasive tumor phenotype",
+  
+  Factor6 = "Immune-excluded tumor microenvironment characterized by interferon response, glycolytic metabolism, mTOR signaling, and hypoxia adaptation",
+  
+  Factor7 = "Cell cycle checkpoint and mTOR signaling program with weak immune associations, potentially representing proliferative but immunologically quiet tumors",
+  
+  Factor8 = "Inflammatory cancer phenotype with EMT, TNFα/NF-κB signaling, KRAS activation, and extracellular matrix organization",
+  
+  Factor9 = "Antiviral immune response signature featuring strong interferon signaling, cytokine activity (CXCL9, GZMA), and regulated cell death pathways",
+  
+  Factor10 = "Differentiation and secretory program with EMT, androgen response, protein secretion, and weak WNT/β-catenin signaling"
+)
+# 1. Create the table data first
+all_factors_table <- create_summary_table(
+  factor_ids = paste0("Factor", 1:10),
+  top_n_pathways = 5,
+  top_n_genes = 10,
+  interpretations = interpretations
+)
+
+```
+
+
+
+
+# Interpretation Report
+
+```{r}
+# Interpretation Report
+
+rmd_html <- "MOFA_factor_summary.Rmd"
+
+writeLines(c(
+  "---",
+  "title: '<center>MOFA Factor Analysis: Biological Pathway Associations</center>'",
+  "output:",
+  "  html_document:",
+  "    toc: true",
+  "    toc_float: true",
+  "    toc_depth: 3",
+  "    number_sections: true",
+  "    theme: journal",
+  "    css: styles.css",
+  "    df_print: paged",
+  "---",
+  "",
+  "```{r setup, include=FALSE}",
+  "knitr::opts_chunk$set(",
+  "  echo = FALSE, warning = FALSE, message = FALSE,",
+  "  fig.align = 'center',",
+  "  fig.width = 7, fig.height = 5,",
+  "  out.width = '100%',",
+  "  fig.show = 'asis'   # ensure plots are printed one below the other",
+  ")",
+  "library(kableExtra)",
+  "library(dplyr)",
+  "library(DT)",
+  "library(patchwork)",
+  "library(ggplot2)",
+  "```",
+  "",
+"<style>",
+"@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Merriweather:wght@400;700&display=swap');",
+"",
+"body {",
+"  font-family: 'Roboto', sans-serif;",
+"  line-height: 1.7;",
+"  color: #2c3e50;",
+"  background-color: #fafafa;",
+"  max-width: 1100px;",
+"  margin: auto;",
+"  padding: 20px;",
+"}",
+"h1, h2, h3 {",
+"  font-family: 'Merriweather', serif;",
+"  color: #1a5276;",
+"  margin-top: 2em;",
+"  padding-bottom: 0.3em;",
+"  border-bottom: 2px solid #5dade2;",
+"}",
+"table {",
+"  border-collapse: collapse;",
+"  margin: 1em 0;",
+"}",
+"th {",
+"  background-color: #5dade2;",
+"  color: #fff;",
+"  padding: 8px;",
+"  text-align: left;",
+"}",
+"td {",
+"  padding: 8px;",
+"  border-bottom: 1px solid #ddd;",
+"}",
+".table-caption {",
+"  font-weight: 600;",
+"  font-size: 1.1em;",
+"  color: #34495e;",
+"  margin-bottom: 8px;",
+"}",
+"code, pre {",
+"  font-family: 'Fira Code', monospace;",
+"  background-color: #f4f6f6;",
+"  padding: 2px 6px;",
+"  border-radius: 4px;",
+"}",
+"</style>",
+  "",
+  "# Introduction",
+  "",
+  "MOFA identifies latent factors that capture coordinated variation across multi-omics datasets. This analysis interprets these factors through their associations with well-curated biological pathways from MSigDB.",
+  "",
+  "# Data Sources and Analytical Pipeline",
+  "- **MOFA Model**: Trained on multi-omics views: Prov-GigaPath WSI Embedding and RNAseq data",
+  "- **Pathway Databases**: MSigDB Hallmark, C2 (Curated), C6 (Oncogenic)",
+  "- **Analysis Methods**: GSEA (preranked), GSVA (sample-level)",
+  "- **Pipeline**:",
+  "  1. Extract factor weights from MOFA model",
+  "  2. Perform preranked GSEA on factor loadings",
+  "  3. Calculate pathway activity scores using GSVA",
+  "  4. Correlate factors with pathway activities",
+  "",
+  "# Latent Factor Visualization",
+  "",
+  "## Heatmaps",
+  "```{r heatmap-plots, fig.width=12, fig.height=10}",
+  "if (exists('plot_gsea_heatmap')) {",
+  "  print(plot_gsea_heatmap('hallmark', top_n_pathways = 30))",
+  "  print(plot_gsva_heatmap('hallmark', top_n_pathways = 20))",
+  "  print(plot_gsea_heatmap('c2', top_n_pathways = 30))",
+  "  print(plot_gsva_heatmap('c2', top_n_pathways = 20))",
+  "  print(plot_gsea_heatmap('c6', top_n_pathways = 20))",
+  "  print(plot_gsva_heatmap('c6', top_n_pathways = 20))",
+  "}",
+  "```",
+  "",
+  "## Factor Plots (GSEA vs GSVA, sequential)",
+  "```{r latent-factor-geomcol, fig.width=12, fig.height=12}",
+  "top_factors <- c('Factor1', 'Factor2', 'Factor3')",
+  "plot_factor_sidebyside_mod <- function(factor_id, gsea_collection = 'c2', gsva_collection = 'c2', n_pathways = 8) {",
+  "  p_gsea <- plot_gsea(factor_id, gsea_collection, n_pathways)",
+  "  if(is.null(p_gsea)) p_gsea <- ggplot() + theme_void() + ggtitle(paste(factor_id, 'GSEA missing'))",
+  "  p_gsva <- plot_gsva(factor_id, gsva_collection, n_pathways)",
+  "  if(is.null(p_gsva)) p_gsva <- ggplot() + theme_void() + ggtitle(paste(factor_id, 'GSVA missing'))",
+  "  return(list(p_gsea, p_gsva))",
+  "}",
+  "plots_list <- lapply(top_factors, function(f) plot_factor_sidebyside_mod(f, n_pathways=8))",
+  "for (pgroup in plots_list) {",
+  "  for (p in pgroup) print(p)",
+  "}",
+  "```",
+  "",
+  "## Summary of Factor Interpretations",
+  "```{r summary-table, results='asis'}",
+  "if (exists('all_factors_table')) {",
+  "  kable(all_factors_table, format = 'html', escape = FALSE,",
+  "        caption = '<strong>Table 1: MOFA Factor Biological Interpretations</strong>') %>%",
+  "    kable_styling(",
+  "      bootstrap_options = c('striped', 'hover', 'condensed'),",
+  "      full_width = TRUE,",
+  "      font_size = 12,",
+  "      position = 'center'",
+  "    ) %>%",
+  "    column_spec(1, bold = TRUE, width = '80px') %>%",
+  "    column_spec(2, width = '100px') %>%",
+  "    column_spec(3, width = '200px') %>%",
+  "    column_spec(4:ncol(all_factors_table), width = '250px') %>%",
+  "    scroll_box(width = '100%', height = '500px')",
+  "}",
+  "```",
+  "",
+  "## Factor Enrichment Plots",
+  "```{r factor-enrichment, fig.width=12, fig.height=12}",
+  "top_n_enrichment <- 3",
+  "for(f in top_factors) {",
+  "  enrichment_plot <- plot_factor_enrichment(f, pathway_collection='hallmark', top_n=top_n_enrichment, all_weights=all_weights)",
+  "  if(!is.null(enrichment_plot)) print(enrichment_plot[[1]])",
+  "}",
+  "```"
+), con = rmd_html)
+
+# Render HTML
+rmarkdown::render(rmd_html ,output_file = "MOFA_factor_summary.html")
+```
+
+
+* Factor 1 represents a proliferative, MYC-driven program enriched for E2F targets, KRAS signaling, and EMT pathways, reflecting high cell-cycle activity and transcriptional programs associated with tumor growth. In the context of colorectal cancer, it likely marks aggressive, mesenchymal-like tumors with enhanced proliferation, invasion, and metastatic potential.
 
 
 
