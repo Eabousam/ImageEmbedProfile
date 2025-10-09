@@ -1,0 +1,75 @@
+---
+title: "mofa-prov-tile_level"
+format: html
+editor: visual
+---
+
+# Libraries
+
+```{r}
+#| output: False
+library(BiocManager)
+library(MOFA2)
+library(remotes)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(SpatialFeatureExperiment)
+library(MultiAssayExperiment)
+library(SummarizedExperiment)
+library(curatedTCGAData)
+library(dplyr)
+library(spatstat)
+library(moments)
+library(pracma)
+library(HistoImageR)
+library(devtools)
+library(ggplot2)
+library(TCGAutils)
+library(rmarkdown)
+library(knitr)
+library(psych)
+
+```
+
+#### prov-gigaPath Colorectal Cancer Tile level embedding
+
+```{r}
+# Create target directory
+#dir.create("../TCGA_COAD_READ_provgigapath_tile_level", showWarnings = FALSE)
+
+# Base URL
+base_url <- "https://u24-cancer-genomics.seandavi.workers.dev/provgigapath/tile_level/"
+
+# Folders to download
+folders <- c("TCGA_COAD/", "TCGA_READ/")
+
+for(f in folders) {
+  # Construct full folder URL
+  folder_url <- paste0(base_url, f)
+  
+  # Use wget recursively, only .csv files, save into local folder
+  cmd <- paste(
+    "wget -r -np -nH --cut-dirs=3 -R index.html",
+    "-P TCGA_COAD_READ_provgigapath_tile_level",
+    folder_url
+  )
+  
+  system(cmd)
+}
+```
+
+#### build embedding matrix
+
+```{r}
+#| label: build-embedding-matrix
+#| cache: true
+#| warning: false
+#| message: false
+
+# Load helper utils fns
+devtools::load_all()
+# Creating matrix for all the images
+
+
+
+```
