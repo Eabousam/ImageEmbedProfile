@@ -48,7 +48,7 @@ library(psych)
 
 ```
 
-#### prov-gigaPath COAD
+#### prov-gigaPath Colorectal Cancer WSI 
 
 ```{r}
 getwd()
@@ -81,6 +81,9 @@ tensor_matrix_full <- na.omit(tensor_matrix)
 # Verify the structure matched layer 0 in csv
 structure_of_matrix = as.data.frame(tensor_matrix_full)
 ```
+
+
+
 
 #### Load in TCGA CRC assay experiment data
 
