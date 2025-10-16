@@ -68,20 +68,291 @@ length(fnames)  # how many slides
 
 # Load helper utils fns
 devtools::load_all()
-# Creating matrix for all the images
-tensor_matrix <- matrix(nrow = length(fnames), ncol = 768)
-slide_ids <- sapply(strsplit(basename(fnames), "\\.csv"), `[`, 1)
-rownames(tensor_matrix) <- slide_ids
+#------------------------------------------
+# Simplify filenames to patient IDs (clean)
+#------------------------------------------
+participant_ids <- gsub(".csv$", "", basename(fnames)) %>% 
+  strsplit(., "-") %>% 
+  sapply(., function(x) paste(x[1:3], collapse = "-"))
 
-for (i in seq_along(fnames)) {
-  tensor_matrix[i,] <- getEmbeddingLayer(fnames[i])
-}
+# import WSI embedding layers 
+structure_layer0  <- getEmbeddingLayer(fnames, participant_ids, layer = 0)
+structure_layer10 <- getEmbeddingLayer(fnames, participant_ids, layer = 10)
+structure_layer11 <- getEmbeddingLayer(fnames, participant_ids, layer = 11)
+structure_layer12 <- getEmbeddingLayer(fnames, participant_ids, layer = 12)
+structure_last <- getEmbeddingLayer(fnames, participant_ids, layer = "last_layer_embed" )
 
-tensor_matrix_full <- na.omit(tensor_matrix)
-# Verify the structure matched layer 0 in csv
-structure_of_matrix = as.data.frame(tensor_matrix_full)
+
 ```
 
+
+
+#### Matching embedding and assay data COAD + READ
+
+
+```{r}
+#------------------------------------------
+# 1. Load COAD + READ RNASeq assays
+#------------------------------------------
+# Load COAD
+coad_mae <- curatedTCGAData(
+  diseaseCode = "COAD",
+  assays = "RNASeq2GeneNorm",
+  version = "2.1.1",
+  dry.run = FALSE
+)
+
+# Load READ
+read_mae <- curatedTCGAData(
+  diseaseCode = "READ",
+  assays = "RNASeq2GeneNorm",
+  version = "2.1.1",
+  dry.run = FALSE
+)
+
+rna_coad <- coad_mae[["COAD_RNASeq2GeneNorm-20160128"]]
+rna_read <- read_mae[["READ_RNASeq2GeneNorm-20160128"]]
+
+colData(coad_mae)
+
+```
+# Prepare summarise experiment objects
+
+```{r}
+#------------------------------------------
+# 2. Ensure consistent genes and merge RNASeq
+#------------------------------------------
+common_genes <- intersect(rownames(rna_coad), rownames(rna_read))
+rna_coad_bulk <- rna_coad[common_genes, , drop = FALSE]
+rna_read_bulk <- rna_read[common_genes, , drop = FALSE]
+rna_combined <- cbind(rna_coad_bulk, rna_read_bulk)
+
+# Standardize patient IDs (first 3 TCGA fields)
+rna_patients <- sapply(strsplit(colnames(rna_combined), "-"), function(x) paste(x[1:3], collapse = "-"))
+colnames(rna_combined) <- make.unique(rna_patients)
+
+#------------------------------------------
+# 3. Prepare embedding layers (keep rownames as patient IDs)
+#------------------------------------------
+prepare_layer <- function(mat) {
+  if (is.null(rownames(mat))) {
+    rownames(mat) <- paste0("patient_", seq_len(nrow(mat)))
+  }
+  mat_unique <- mat[!duplicated(rownames(mat)), , drop = FALSE]
+  return(mat_unique)
+}
+
+structure_layer0  <- prepare_layer(structure_layer0)
+structure_layer10 <- prepare_layer(structure_layer10)
+structure_layer11 <- prepare_layer(structure_layer11)
+structure_layer12 <- prepare_layer(structure_layer12)
+structure_last    <- prepare_layer(structure_last)
+
+#------------------------------------------
+# 4. Prepare clinical metadata
+#------------------------------------------
+coad_clinical <- as.data.frame(colData(coad_mae))
+read_clinical <- as.data.frame(colData(read_mae))
+
+surv_vars <- c("vital_status.x", "days_to_death.x", 
+               "patient.days_to_last_followup", "patient.days_to_last_known_alive")
+
+# Subset columns with >95% completeness or survival variables
+coad_sub <- coad_clinical[, colSums(!is.na(coad_clinical))/nrow(coad_clinical) * 100 > 95 | colnames(coad_clinical) %in% surv_vars, drop = FALSE]
+read_sub <- read_clinical[, colSums(!is.na(read_clinical))/nrow(read_clinical) * 100 > 95 | colnames(read_clinical) %in% surv_vars, drop = FALSE]
+
+# Remove technical columns
+coad_sub <- coad_sub %>% select(-matches("aliquot"), -matches("portion"))
+read_sub <- read_sub %>% select(-matches("aliquot"), -matches("portion"))
+
+# Harmonize columns across COAD + READ
+all_cols <- union(colnames(coad_sub), colnames(read_sub))
+for (col in setdiff(all_cols, colnames(coad_sub))) coad_sub[[col]] <- NA
+for (col in setdiff(all_cols, colnames(read_sub))) read_sub[[col]] <- NA
+
+clinical_sub <- rbind(coad_sub, read_sub)
+
+# Factorize categorical variables (2–10 levels)
+numLv <- sapply(clinical_sub, function(x) length(unique(x)))
+slideAttrNames <- names(numLv[numLv >= 2 & numLv <= 10])
+for (attr in slideAttrNames) clinical_sub[[attr]] <- as.factor(clinical_sub[[attr]])
+
+#------------------------------------------
+# 5. Match patients with embeddings
+#------------------------------------------
+patients_with_embed <- Reduce(union, lapply(list(structure_layer0, structure_layer10,
+                                                 structure_layer11, structure_layer12,
+                                                 structure_last), rownames))
+
+# Subset clinical metadata to only patients with embeddings
+metadata_df <- clinical_sub[rownames(clinical_sub) %in% patients_with_embed, , drop = FALSE]
+
+#------------------------------------------
+# 6. Match RNASeq to patients with embeddings
+#------------------------------------------
+rna_matched <- rna_combined[, colnames(rna_combined) %in% rownames(metadata_df), drop = FALSE]
+
+# Remove genes with non-finite values
+rna_keep <- apply(rna_matched, 1, function(x) all(is.finite(x)))
+rna_matched_clean <- rna_matched[rna_keep, , drop = FALSE]
+
+#------------------------------------------
+# 7. Create SummarizedExperiment objects for each embedding layer
+#------------------------------------------
+
+# Ensure metadata rownames match patient IDs
+rownames(metadata_df) <- metadata_df$patientID
+
+make_embed_se <- function(mat, metadata_df) {
+  # Keep only patients present in both the matrix and metadata
+  patients <- intersect(rownames(mat), rownames(metadata_df))
+  
+  # Subset matrix and metadata
+  mat_subset <- mat[patients, , drop = FALSE]
+  metadata_subset <- metadata_df[patients, , drop = FALSE]
+  
+  # Create SE: columns = patients, rows = features/dims
+  se <- SummarizedExperiment(
+    assays = list(embedding = t(mat_subset)),  # t(): features x patients
+    colData = metadata_subset
+  )
+  
+  # Give rownames to features/dims
+  rownames(se) <- paste0("dim_", seq_len(nrow(se)))
+  return(se)
+}
+
+embedding_se_layer0  <- make_embed_se(structure_layer0, metadata_df)
+embedding_se_layer10 <- make_embed_se(structure_layer10, metadata_df)
+embedding_se_layer11 <- make_embed_se(structure_layer11, metadata_df)
+embedding_se_layer12 <- make_embed_se(structure_layer12, metadata_df)
+embedding_se_last    <- make_embed_se(structure_last, metadata_df)
+
+
+#------------------------------------------
+# 8. Create RNA SummarizedExperiment
+#------------------------------------------
+# Ensure colData rownames match assay column names
+coldata_rna <- DataFrame(patientID = colnames(rna_matched_clean))
+rownames(coldata_rna) <- colnames(rna_matched_clean)
+
+rna_se <- SummarizedExperiment(
+  assays = list(counts = assay(rna_matched_clean)),
+  colData = coldata_rna
+)
+
+
+#------------------------------------------
+# 9. Build MultiAssayExperiment
+#------------------------------------------
+# Make sure colData rownames match RNA columns
+metadata_mae <- metadata_df[colnames(rna_se), , drop = FALSE]
+
+crc_mae <- MultiAssayExperiment(
+  experiments = list(
+    RNASeq = rna_se,
+    Embedding_layer0  = embedding_se_layer0,
+    Embedding_layer10 = embedding_se_layer10,
+    Embedding_layer11 = embedding_se_layer11,
+    Embedding_layer12 = embedding_se_layer12,
+    Embedding_last    = embedding_se_last
+  ),
+  colData = metadata_mae
+)
+
+# Check rownames of each experiment
+exps <- experiments(crc_mae)
+lapply(exps, function(x) head(rownames(x)))
+```
+
+
+
+
+
+
+#### Running MOFA2 analysis
+
+```{r}
+# Create MOFA object
+mofa_object <- create_mofa_from_MultiAssayExperiment(crc_mae)
+class(crc_mae)
+# Define model options
+model_opts <- get_default_model_options(mofa_object)
+model_opts$num_factors <- 15
+
+# Define training options
+train_opts <- get_default_training_options(mofa_object)
+train_opts$convergence_mode <- "slow"
+train_opts$seed <- 42
+
+# Prepare and run MOFA
+mofa_object <- prepare_mofa(
+  object = mofa_object,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+
+
+```
+
+```{r}
+#| label: train-mofa-model
+
+# Run/train the model 
+
+mofa_object.trained <- run_mofa(
+  mofa_object,
+  outfile = "mofa_model_rnaseq_5emb.hdf5",
+  use_basilisk = TRUE
+)
+
+# Load trained MOFA model
+mofa_object.trained <- load_model("mofa_model_rnaseq_5emb.hdf5")
+
+#------------------------------------------
+# 1. Get MOFA sample names
+#------------------------------------------
+mofa_samples <- unlist(samples_names(mofa_object.trained))  # vector of sample IDs
+
+#------------------------------------------
+# 2. Subset metadata to match MOFA samples
+#------------------------------------------
+metadata_matched <- metadata_df[mofa_samples, , drop = FALSE]
+
+# Ensure rownames match MOFA sample names exactly
+rownames(metadata_matched) <- mofa_samples
+
+#------------------------------------------
+# 3. Add sample column if needed
+#------------------------------------------
+metadata_matched$sample <- rownames(metadata_matched)
+
+#------------------------------------------
+# 4. Assign metadata to MOFA object
+#------------------------------------------
+samples_metadata(mofa_object.trained) <- metadata_matched
+
+# Save the updated object (RDS is easiest)
+saveRDS(mofa_object.trained, file = "mofa_model_with_metadata.rds")
+
+
+# visualize the model views and samples
+plot_data_overview(mofa_object.trained)
+
+# Plot factor correlations to check for interdependence issues with the model
+plot_factor_cor(mofa_object.trained)
+
+
+# Plot variance explained
+plot_variance_explained(mofa_object.trained)
+
+
+```
+
+
+
+## misc
 
 
 
@@ -208,232 +479,5 @@ res_embed <- HistoImageR:::analyze_embedding_separation(embedding_embed_mat, met
 # View results
 res_embed$plots
 ```
-
-#### Matching embedding and assay data COAD + READ
-
-
-```{r}
-#------------------------------------------
-# 1. Load COAD + READ RNASeq assays
-#------------------------------------------
-# Load COAD
-coad_mae <- curatedTCGAData(
-  diseaseCode = "COAD",
-  assays = "RNASeq2GeneNorm",
-  version = "2.1.1",
-  dry.run = FALSE
-)
-
-# Load READ
-read_mae <- curatedTCGAData(
-  diseaseCode = "READ",
-  assays = "RNASeq2GeneNorm",
-  version = "2.1.1",
-  dry.run = FALSE
-)
-
-rna_coad <- coad_mae[["COAD_RNASeq2GeneNorm-20160128"]]
-rna_read <- read_mae[["READ_RNASeq2GeneNorm-20160128"]]
-
-colData(coad_mae)
-
-```
-
-#### Find common genes
-```{r}
-#------------------------------------------
-# 2. Ensure consistent genes
-#------------------------------------------
-common_genes <- intersect(rownames(rna_coad), rownames(rna_read))
-rna_coad_bulk <- rna_coad[common_genes, ]
-rna_read_bulk <- rna_read[common_genes, ]
-
-# Merge RNASeq matrices
-rna_combined <- cbind(rna_coad_bulk, rna_read_bulk)
-
-# Standardize patient IDs (first 3 TCGA fields)
-rna_patients <- sapply(strsplit(colnames(rna_combined), "-"), function(x) paste(x[1:3], collapse = "-"))
-colnames(rna_combined) <- make.unique(rna_patients)
-
-#------------------------------------------
-# 3. Prepare embedding matrix
-#------------------------------------------
-tensor_matrix_unique <- tensor_matrix_full[!duplicated(rownames(tensor_matrix_full)), ]
-embedding_patients <- sapply(strsplit(rownames(tensor_matrix_unique), "-"), function(x) paste(x[1:3], collapse = "-"))
-rownames(tensor_matrix_unique) <- make.unique(embedding_patients)
-
-#------------------------------------------
-# 4. Prepare clinical metadata while keeping survival vars
-#------------------------------------------
-
-# Subset COAD clinical metadata
-coad_clinical <- colData(coad_mae) %>% as.data.frame()
-read_clinical <- colData(read_mae) %>% as.data.frame()
-
-# Define survival variables to keep regardless of completeness
-surv_vars <- c("vital_status.x", "days_to_death.x", 
-               "patient.days_to_last_followup", "patient.days_to_last_known_alive")
-
-# Calculate completeness for all columns
-coad_completeness <- colSums(!is.na(coad_clinical)) / nrow(coad_clinical) * 100
-read_completeness <- colSums(!is.na(read_clinical)) / nrow(read_clinical) * 100
-
-# Keep columns >95% complete OR survival variables
-coad_clinical_sub <- coad_clinical[, coad_completeness > 95 | colnames(coad_clinical) %in% surv_vars]
-read_clinical_sub <- read_clinical[, read_completeness > 95 | colnames(read_clinical) %in% surv_vars]
-
-# Remove aliquot/portion columns
-coad_clinical_sub <- coad_clinical_sub %>% select(-matches("aliquot"), -matches("portion"))
-read_clinical_sub <- read_clinical_sub %>% select(-matches("aliquot"), -matches("portion"))
-
-# Ensure all columns exist in both datasets
-all_cols <- union(colnames(coad_clinical_sub), colnames(read_clinical_sub))
-for (col in setdiff(all_cols, colnames(coad_clinical_sub))) coad_clinical_sub[[col]] <- NA
-for (col in setdiff(all_cols, colnames(read_clinical_sub))) read_clinical_sub[[col]] <- NA
-
-# Merge COAD + READ metadata
-clinical_sub <- rbind(coad_clinical_sub, read_clinical_sub)
-
-# Keep only patients with embeddings
-patients_with_embed <- rownames(tensor_matrix_unique)
-clinical_sub <- clinical_sub[rownames(clinical_sub) %in% patients_with_embed, ]
-
-# Factorize categorical variables with 2–10 levels, excluding survival vars
-cat_vars <- setdiff(names(clinical_sub), surv_vars)
-numLv <- sapply(clinical_sub[, cat_vars, drop = FALSE], function(x) length(unique(x)))
-slideAttrNames <- names(numLv[numLv >= 2 & numLv <= 10])
-for (slideAttrName in slideAttrNames) {
-  clinical_sub[[slideAttrName]] <- as.factor(clinical_sub[[slideAttrName]])
-}
-
-# Combine factorized categorical variables with survival vars
-metadata_df <- clinical_sub[, c(slideAttrNames, surv_vars)]
-
-#------------------------------------------
-# 5. Subset RNASeq to patients with embeddings
-#------------------------------------------
-rna_matched <- rna_combined[, colnames(rna_combined) %in% patients_with_embed, drop = FALSE]
-
-# Remove genes with Inf/-Inf
-rna_matrix <- assay(rna_matched)
-rna_keep <- apply(rna_matrix, 1, function(x) all(is.finite(x)))
-rna_matched_clean <- rna_matched[rna_keep, ]
-
-# Subset embedding to match RNA columns
-embedding_matched_clean <- tensor_matrix_unique[colnames(rna_matched_clean), , drop = FALSE]
-
-#------------------------------------------
-# 6. Build SummarizedExperiment objects
-#------------------------------------------
-rna_se <- SummarizedExperiment(
-  assays = list(counts = assay(rna_matched_clean)),
-  colData = DataFrame(patientID = colnames(rna_matched_clean))
-)
-
-# Embedding summarised exp
-
-# Subset metadata for patients with embeddings
-metadata_matched <- metadata_df[colnames(rna_matched_clean), , drop = FALSE]
-
-# Fix rownames to match assay columns exactly
-rownames(metadata_matched) <- colnames(rna_matched_clean)
-
-# Create SummarizedExperiment
-embedding_se <- SummarizedExperiment(
-  assays = list(embedding = t(embedding_matched_clean)),
-  colData = metadata_matched
-)
-
-rownames(embedding_se) <- paste0("embed_", seq_len(nrow(embedding_se)))
-
-#------------------------------------------
-# 7. Build MultiAssayExperiment
-#------------------------------------------
-crc_mae <- MultiAssayExperiment(
-  experiments = list(
-    # labeing this contains both COAD + READ RNASeq data
-    RNASeq = rna_se,
-    Embedding_layer0 = embedding_se
-  ),
-  colData = metadata_df[colnames(rna_matched_clean), , drop = FALSE]
-)
-
-
-
-```
-
-#### Running MOFA2 analysis
-
-```{r}
-# Create MOFA object
-mofa_object <- create_mofa_from_MultiAssayExperiment(crc_mae)
-
-# Define model options
-model_opts <- get_default_model_options(mofa_object)
-model_opts$num_factors <- 15
-
-# Define training options
-train_opts <- get_default_training_options(mofa_object)
-train_opts$convergence_mode <- "slow"
-train_opts$seed <- 42
-
-# Prepare and run MOFA
-mofa_object <- prepare_mofa(
-  object = mofa_object,
-  model_options = model_opts,
-  training_options = train_opts
-)
-
-
-
-```
-
-```{r}
-#| label: train-mofa-model
-
-# Run/train the model 
-
-#mofa_object.trained <- run_mofa(
-#  mofa_object,
-#  outfile = "mofa_model_crc.hdf5",
-#  use_basilisk = TRUE
-#)
-
-
-# Load trained MOFA model
-mofa_object.trained <- load_model("mofa_model_crc.hdf5")
-
-#------------------------------------------
-# 1. Get MOFA sample names
-#------------------------------------------
-mofa_samples <- unlist(samples_names(mofa_object.trained))  # vector of sample IDs
-
-#------------------------------------------
-# 2. Subset metadata to match MOFA samples
-#------------------------------------------
-metadata_matched <- metadata_df[mofa_samples, , drop = FALSE]
-
-# Ensure rownames match MOFA sample names exactly
-rownames(metadata_matched) <- mofa_samples
-
-#------------------------------------------
-# 3. Add sample column if needed
-#------------------------------------------
-metadata_matched$sample <- rownames(metadata_matched)
-
-#------------------------------------------
-# 4. Assign metadata to MOFA object
-#------------------------------------------
-samples_metadata(mofa_object.trained) <- metadata_matched
-
-# Save the updated object (RDS is easiest)
-saveRDS(mofa_object.trained, file = "mofa_model_with_metadata.rds")
-
-
-
-
-```
-
-
 
 
