@@ -21,8 +21,8 @@ editor_options:
   chunk_output_type: inline
 ---
 
+## Libraries
 
-## Libraries 
 ```{r setup, include=FALSE}
 # Load required libraries
 library(MOFA2)
@@ -39,12 +39,11 @@ library(GSVA)
 library(Hmisc)
 library(pheatmap)
 library(DT)
+library(tidyverse)
 
 devtools::load_all()
 
 ```
-
-
 
 #### Analyze MOFA model
 
@@ -52,10 +51,12 @@ devtools::load_all()
 #| label: load-mofa
 # Load trained MOFA model
 
-mofa_object.trained <- readRDS("mofa_model_with_metadata.rds")
+#mofa_object.trained <- readRDS("mofa_model_with_metadata.rds")
+mofa_object.trained <- readRDS("mofa_model_lastembed_with_metadata.rds")
 # visualize the model views and samples
 plot_data_overview(mofa_object.trained)
-
+samples_metadata(mofa_object.trained) <- metadata_matched
+names(metadata_matched)
 # Plot factor correlations to check for interdependence issues with the model
 plot_factor_cor(mofa_object.trained)
 
@@ -93,7 +94,7 @@ plot_data_heatmap(mofa_object.trained,
 # Using embedding view
 plot_data_heatmap(mofa_object.trained,
                   factor = 1,
-                  view = "Embedding_layer0",
+                  view = "Embedding_last",
                   features = 10,
                   cluster_rows = FALSE,
                   cluster_cols = FALSE,
@@ -119,7 +120,7 @@ plot_factor(mofa_object.trained,
             color_by = "pathology_T_stage")
 
 plot_top_weights(mofa_object.trained,
-                 view = "Embedding_layer0",
+                 view = "Embedding_last",
                  factor = 1,
                  nfeatures = 10)
 
@@ -131,8 +132,6 @@ correlate_factors_with_covariates(mofa_object.trained,
 
 
 ```
-
-
 
 # Factor Contribution
 
@@ -213,7 +212,6 @@ ggplot(cum_sum_df, aes(x = Factor, y = Cumsum, color = View)) +
   theme_minimal()
 ```
 
-
 ```{r}
 plot_weights(mofa_object.trained, 
              view = 2, 
@@ -222,906 +220,412 @@ plot_weights(mofa_object.trained,
 # if we have tile embeddings with some coords, we can figure out where they are in the slide image??
 ```
 
-
 # PCA interpretation
 
 ### Matrices
 
 ```{r}
-# Load helper utils fns
-devtools::load_all()
-dir <- "../TCGA_COAD_READ_provgigapath"
-fnames <- list.files(dir, pattern = "\\.csv$", full.names = TRUE)
-# Creating matrix for all the images
-tensor_matrix <- matrix(nrow = length(fnames), ncol = 768)
-slide_ids <- sapply(strsplit(basename(fnames), "\\.csv"), `[`, 1)
-rownames(tensor_matrix) <- slide_ids
+#==============================================================
+# 1. Get factor scores
+#==============================================================
+factor_scores <- get_factors(mofa_object.trained, factors = "all", as.data.frame = FALSE)[[1]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("patient_id")
 
-for (i in seq_along(fnames)) {
-  tensor_matrix[i,] <- getEmbeddingLayer(fnames[i])
-}
+#==============================================================
+# 2. Load embeddings (last layer only)
+#==============================================================
+devtools::load_all()  # contains getEmbeddingLayer()
 
-tensor_matrix_full <- na.omit(tensor_matrix)
+participant_ids <- gsub(".csv$", "", basename(fnames)) %>% 
+  strsplit(., "-") %>% 
+  sapply(\(x) paste(x[1:3], collapse = "-"))
 
+structure_last <- getEmbeddingLayer(fnames, participant_ids, layer = "last_layer_embed")
 
-#------------------------------------------
-# 1. Load COAD + READ RNASeq assays
-#------------------------------------------
-# Load COAD
-coad_mae <- curatedTCGAData(
-  diseaseCode = "COAD",
-  assays = "RNASeq2GeneNorm",
-  version = "2.1.1",
-  dry.run = FALSE
+#==============================================================
+# 3. Align patients between MOFA factors and embeddings
+#==============================================================
+shared_ids <- intersect(rownames(structure_last), factor_scores$patient_id)
+
+embedding_matched <- structure_last[shared_ids, , drop = FALSE]
+factor_scores_matched <- factor_scores[factor_scores$patient_id %in% shared_ids, ]
+rownames(factor_scores_matched) <- factor_scores_matched$patient_id
+factor_scores_matched <- factor_scores_matched[shared_ids, , drop = FALSE]
+
+#==============================================================
+# 4. Table 1: Correlation (factors × embedding dims)
+#==============================================================
+cor_mat <- cor(
+  factor_scores_matched[, -1],
+  embedding_matched,
+  use = "pairwise.complete.obs"
 )
 
-# Load READ
-read_mae <- curatedTCGAData(
-  diseaseCode = "READ",
-  assays = "RNASeq2GeneNorm",
-  version = "2.1.1",
-  dry.run = FALSE
-)
+embedding_corr_table <- as.data.frame(cor_mat) %>%
+  tibble::rownames_to_column("Factor") %>%
+  tidyr::pivot_longer(-Factor,
+                      names_to = "Embedding_Dimension",
+                      values_to = "Correlation") %>%
+  dplyr::mutate(Abs_Corr = abs(Correlation)) %>%
+  dplyr::arrange(Factor, desc(Abs_Corr))
 
-rna_coad <- coad_mae[["COAD_RNASeq2GeneNorm-20160128"]]
-rna_read <- read_mae[["READ_RNASeq2GeneNorm-20160128"]]
+#==============================================================
+# 5. Table 2: Top weighted embeddings from MOFA
+#==============================================================
+embedding_weights <- get_weights(mofa_object.trained, view = "Embedding_last", as.data.frame = FALSE)[[1]]
 
-colData(coad_mae)
+embedding_weight_table <- lapply(seq_len(ncol(embedding_weights)), function(f) {
+  tibble::tibble(
+    Factor = colnames(embedding_weights)[f],
+    Embedding_Dimension = rownames(embedding_weights),
+    Weight = embedding_weights[, f],
+    Abs_Weight = abs(embedding_weights[, f])
+  ) %>%
+    dplyr::arrange(desc(Abs_Weight)) %>%
+    dplyr::slice_head(n = 20)  # top 20 per factor
+}) %>%
+  dplyr::bind_rows()
 
-#### Find common genes
-#------------------------------------------
-# 2. Ensure consistent genes
-#------------------------------------------
-common_genes <- intersect(rownames(rna_coad), rownames(rna_read))
-rna_coad_bulk <- rna_coad[common_genes, ]
-rna_read_bulk <- rna_read[common_genes, ]
-
-# Merge RNASeq matrices
-rna_combined <- cbind(rna_coad_bulk, rna_read_bulk)
-
-# Standardize patient IDs (first 3 TCGA fields)
-rna_patients <- sapply(strsplit(colnames(rna_combined), "-"), function(x) paste(x[1:3], collapse = "-"))
-colnames(rna_combined) <- make.unique(rna_patients)
-
-#------------------------------------------
-# 3. Prepare embedding matrix
-#------------------------------------------
-tensor_matrix_unique <- tensor_matrix_full[!duplicated(rownames(tensor_matrix_full)), ]
-embedding_patients <- sapply(strsplit(rownames(tensor_matrix_unique), "-"), function(x) paste(x[1:3], collapse = "-"))
-rownames(tensor_matrix_unique) <- make.unique(embedding_patients)
-
-#------------------------------------------
-# 4. Prepare clinical metadata while keeping survival vars
-#------------------------------------------
-
-# Subset COAD clinical metadata
-coad_clinical <- colData(coad_mae) %>% as.data.frame()
-read_clinical <- colData(read_mae) %>% as.data.frame()
-
-# Define survival variables to keep regardless of completeness
-surv_vars <- c("vital_status.x", "days_to_death.x", 
-               "patient.days_to_last_followup", "patient.days_to_last_known_alive")
-
-# Calculate completeness for all columns
-coad_completeness <- colSums(!is.na(coad_clinical)) / nrow(coad_clinical) * 100
-read_completeness <- colSums(!is.na(read_clinical)) / nrow(read_clinical) * 100
-
-# Keep columns >95% complete OR survival variables
-coad_clinical_sub <- coad_clinical[, coad_completeness > 95 | colnames(coad_clinical) %in% surv_vars]
-read_clinical_sub <- read_clinical[, read_completeness > 95 | colnames(read_clinical) %in% surv_vars]
-
-# Remove aliquot/portion columns
-coad_clinical_sub <- coad_clinical_sub %>% select(-matches("aliquot"), -matches("portion"))
-read_clinical_sub <- read_clinical_sub %>% select(-matches("aliquot"), -matches("portion"))
-
-# Ensure all columns exist in both datasets
-all_cols <- union(colnames(coad_clinical_sub), colnames(read_clinical_sub))
-for (col in setdiff(all_cols, colnames(coad_clinical_sub))) coad_clinical_sub[[col]] <- NA
-for (col in setdiff(all_cols, colnames(read_clinical_sub))) read_clinical_sub[[col]] <- NA
-
-# Merge COAD + READ metadata
-clinical_sub <- rbind(coad_clinical_sub, read_clinical_sub)
-
-# Keep only patients with embeddings
-patients_with_embed <- rownames(tensor_matrix_unique)
-clinical_sub <- clinical_sub[rownames(clinical_sub) %in% patients_with_embed, ]
-
-# Factorize categorical variables with 2–10 levels, excluding survival vars
-cat_vars <- setdiff(names(clinical_sub), surv_vars)
-numLv <- sapply(clinical_sub[, cat_vars, drop = FALSE], function(x) length(unique(x)))
-slideAttrNames <- names(numLv[numLv >= 2 & numLv <= 10])
-for (slideAttrName in slideAttrNames) {
-  clinical_sub[[slideAttrName]] <- as.factor(clinical_sub[[slideAttrName]])
-}
-
-# Combine factorized categorical variables with survival vars
-metadata_df <- clinical_sub[, c(slideAttrNames, surv_vars)]
-
-#------------------------------------------
-# 5. Subset RNASeq to patients with embeddings
-#------------------------------------------
-rna_matched <- rna_combined[, colnames(rna_combined) %in% patients_with_embed, drop = FALSE]
-
-# Remove genes with Inf/-Inf
-rna_matrix <- assay(rna_matched)
-rna_keep <- apply(rna_matrix, 1, function(x) all(is.finite(x)))
-rna_matched_clean <- rna_matched[rna_keep, ]
-
-# Subset embedding to match RNA columns
-embedding_matched_clean <- tensor_matrix_unique[colnames(rna_matched_clean), , drop = FALSE]
-as.data.frame(embedding_matched_clean)
-```
-
-```{r}
-# =========================================================
-# RNASeq → PCA → Correlation with Embeddings & MOFA Factors
-# =========================================================
-
-# --- Step 0: Setup matrices ---
-# Ensure matrices are samples × features/dimensions
-rnaseq_mat <- t(rna_matrix)              # 606 samples × 11135 genes
-embedding_mat <- embedding_matched_clean # 606 samples × 266 embeddings
-factors_mat <- get_factors(mofa_object.trained)[[1]] # 606 samples × 15 MOFA factors
-
-# --- Step 1: Handle missing data in RNASeq ---
-# Critical: PCA cannot handle NA values, RNASeq often has missing values
-# Option: simple column mean imputation (fast) or KNN imputation (better preserves correlations)
-library(matrixStats)
-
-col_means <- colMeans(rnaseq_mat, na.rm = TRUE)
-rnaseq_mat_imputed <- rnaseq_mat
-for (j in seq_len(ncol(rnaseq_mat_imputed))) {
-  rnaseq_mat_imputed[is.na(rnaseq_mat_imputed[, j]), j] <- col_means[j]
-}
-
-# --- Step 2: PCA on RNASeq ---
-# Centering and scaling genes is standard
-pca_rna <- prcomp(rnaseq_mat_imputed, center = TRUE, scale. = TRUE)
-# RNA PCs (rows = samples, cols = PCs)
-rna_pcs <- pca_rna$x
-rownames(rna_pcs) <- rownames(rnaseq_mat)  # samples
-colnames(rna_pcs) <- paste0("PC", 1:ncol(rna_pcs))
-
-# Embeddings (rows = samples, cols = embeddings)
-embedding_mat <- embedding_matched_clean
-rownames(embedding_mat) <- rownames(rnaseq_mat)  # samples
-colnames(embedding_mat) <- paste0("Embed", 1:ncol(embedding_mat))
-# --- Step 3: Correlation of RNASeq PCs with MOFA factors ---
-# Check how RNASeq variation aligns with MOFA latent factors
-cor_pc_factors <- cor(rna_pcs, factors_mat) # PCs × Factors
-
-# --- Step 4: Correlation of RNASeq PCs with embeddings ---
-# Check which embeddings capture major RNASeq variation
-cor_pc_embed <- cor(rna_pcs, embedding_mat) # PCs × Embeddings
-
-# --- Step 5: Identify top correlated embeddings for each PC ---
-top_n <- 5
-top_embeddings <- apply(cor_pc_embed, 1, function(x) {
-  # Take absolute correlation to capture strength, ignoring direction
-  names(sort(abs(x), decreasing = TRUE))[1:top_n]
-})
-
-
-# 5. Optional: Top correlated MOFA factors for each PC
-top_factors <- apply(cor_pc_factors, 1, function(x) {
-  names(sort(abs(x), decreasing = TRUE))[1:top_n]
-})
-
-
-# cor_pc_embed is PCs × embeddings
-pheatmap(cor_pc_embed,
-         cluster_rows = TRUE,    # cluster PCs
-         cluster_cols = TRUE,    # cluster embeddings
-         show_rownames = TRUE,
-         show_colnames = FALSE,  # optional if many embeddings
-         color = colorRampPalette(c("blue", "white", "red"))(50),
-         main = "Correlation of RNASeq PCs with Embeddings")
-
-
-library(ggplot2)
-
-# Example: top embedding for PC1
-top_embed_pc1 <- names(sort(abs(cor_pc_embed[1, ]), decreasing = TRUE))[1]
-
-df_plot <- data.frame(
-  PC1 = rna_pcs[,1],
-  Embedding = embedding_mat[, top_embed_pc1]
-)
-
-ggplot(df_plot, aes(x = PC1, y = Embedding)) +
-  geom_point(alpha = 0.6) +
-  geom_smooth(method = "lm", col = "red") +
-  labs(title = paste("PC1 vs", top_embed_pc1),
-       x = "RNASeq PC1", y = "Embedding") +
-  theme_minimal()
+#==============================================================
+# Outputs
+#==============================================================
+head(embedding_corr_table)
+head(embedding_weight_table)
 ```
 
 
-
+# Projection of embeddings
 
 ```{r}
-library(tidyverse)
+# matrices
+X <- as.matrix(embedding_matched)                 # N x D
+Y <- as.matrix(factor_scores_matched[ , -1 ])     # N x F
 
-# =========================================================
-# DEBUG THE MAPPING ISSUE
-# =========================================================
+# center/scale X and Y as needed
+Xs <- scale(X)          # mean 0, sd 1
+Ys <- scale(Y)
 
-cat("=== DEBUGGING MAPPING ISSUE ===\n")
+W <- as.matrix(embedding_weights)    # D x F (rownames = embedding dims, colnames = Factor names)
 
-# Check the original embedding_weights structure
-cat("Original embedding_weights feature column:\n")
-print(head(embedding_weights$feature))
-cat("Class:", class(embedding_weights$feature), "\n")
-cat("Levels (first 10):", head(levels(embedding_weights$feature), 10), "\n")
-cat("Levels (last 10):", tail(levels(embedding_weights$feature), 10), "\n")
+# choose factor j (or loop)
+j <- "Factor3"
+w_j <- W[, j]                        # length D
 
-# Let's see what happens when we convert to numeric
-test_conversion <- as.numeric(embedding_weights$feature[1:10])
-cat("Numeric conversion of first 10 features:\n")
-print(test_conversion)
+# project each sample into that MOFA-derived direction
+proj_wj <- Xs %*% w_j                # N x 1
 
-# Check if there are any NA values in the conversion
-cat("NA values in numeric conversion:", sum(is.na(test_conversion)), "\n")
-
-# =========================================================
-# FIXED MAPPING APPROACH
-# =========================================================
-
-# The issue is that the factor levels include both genes and embeddings
-# We need to extract only the embedding indices
-
-# Method 1: Extract embedding numbers from factor levels
-cat("\n=== METHOD 1: EXTRACT FROM FACTOR LEVELS ===\n")
-
-# Get the last 768 levels (which should be the embeddings)
-all_levels <- levels(embedding_weights$feature)
-embedding_levels <- tail(all_levels, 768)
-cat("First 5 embedding levels:", head(embedding_levels, 5), "\n")
-cat("Last 5 embedding levels:", tail(embedding_levels, 5), "\n")
-
-# Create mapping from these levels
-embedding_mapping <- data.frame(
-  factor_level = embedding_levels,
-  embedding_name = paste0("embed_", 1:768)
+# compare to factor scores
+cor(proj_wj, Ys[, j])
+plot(
+  Ys[, j], proj_wj,
+  xlab = paste("MOFA factor", j, "score"),
+  ylab = "Projection on embedding weights",
+  main = paste("Embedding–Factor association:", j),
+  pch = 16, col = "gray40"
 )
+abline(lm(proj_wj ~ Ys[, j]), col = "red", lwd = 2)
 
-# Apply the mapping
-embedding_weights_fixed <- embedding_weights %>%
-  mutate(
-    feature = embedding_mapping$embedding_name[match(as.character(feature), embedding_mapping$factor_level)]
-  )
 
-# Check the result
-cat("After mapping - first few features:\n")
-print(head(embedding_weights_fixed$feature))
-cat("NA values after mapping:", sum(is.na(embedding_weights_fixed$feature)), "\n")
+heatmap(embedding_weights, scale = "row",
+        xlab = "MOFA factors", ylab = "Embedding dimensions",
+        main = "Embedding–Factor weight structure")
 
-# =========================================================
-# METHOD 2: DIRECT STRING EXTRACTION
-# =========================================================
 
-cat("\n=== METHOD 2: DIRECT STRING EXTRACTION ===\n")
 
-# Convert to character and check what we have
-feature_chars <- as.character(embedding_weights$feature)
-cat("First 10 features as character:\n")
-print(head(feature_chars, 10))
-cat("Last 10 features as character:\n")
-print(tail(feature_chars, 10))
+```
 
-# Check if they contain "embed_" pattern
-contains_embed <- grepl("embed_", feature_chars)
-cat("Features containing 'embed_':", sum(contains_embed), "\n")
 
-# Since they don't contain "embed_", let's assume they're all embeddings
-# and map them directly
-embedding_weights_fixed_v2 <- embedding_weights %>%
-  mutate(
-    # Convert factor to character
-    feature_char = as.character(feature),
-    # Extract the numeric part - they seem to be consecutive numbers
-    # We'll map the smallest number to embed_1, etc.
-    numeric_index = as.numeric(feature_char),
-    # Find the minimum to establish offset
-    min_index = min(numeric_index),
-    max_index = max(numeric_index),
-    # Calculate embedding number
-    embed_number = numeric_index - min_index + 1,
-    # Create embedding name
-    feature = paste0("embed_", embed_number)
-  )
+# Analyse clusters of embeddings
 
-cat("Range of numeric indices:", 
-    min(embedding_weights_fixed_v2$numeric_index), "to", 
-    max(embedding_weights_fixed_v2$numeric_index), "\n")
-cat("First 5 mapped features:\n")
-print(head(embedding_weights_fixed_v2$feature, 5))
-
-# =========================================================
-# SIMPLIFIED ANALYSIS WITH DIRECT MAPPING
-# =========================================================
-
-# Let's use the working mapping from Method 2
-embedding_weights_clean <- embedding_weights_fixed_v2
-
-# Simple analysis function
-analyze_factor_simple <- function(factor_name) {
-  cat("\nAnalyzing", factor_name, "...\n")
+```{r}
+# Clean cluster analysis for Factor3 with both GSEA and GSVA
+analyze_factor3_clusters <- function() {
   
-  # Get top embedding for this factor
-  top_embed <- embedding_weights_clean %>%
-    filter(factor == factor_name) %>%
-    arrange(desc(abs(value))) %>%
-    slice(1)
+  # 1. Get projections and actual scores
+  proj <- Xs %*% W[, "Factor3"]
+  actual_scores <- Ys[, "Factor3"]
   
-  if (nrow(top_embed) == 0) {
-    cat("No embeddings found for", factor_name, "\n")
-    return(NULL)
+  # 2. Simple cluster assignment
+  clusters <- ifelse(proj > median(proj), "Cluster1", "Cluster2")
+  
+  # 3. Create results with metadata and pathways
+  results_df <- data.frame(
+    sample_id = rownames(Xs),
+    projection = proj,
+    factor_score = actual_scores,
+    cluster = clusters
+  )
+  
+  # 4. Add key metadata
+  metadata <- samples_metadata(mofa_object.trained)
+  key_metadata <- metadata[, c("patientID", "tumor_tissue_site", "pathologic_stage", 
+                              "pathology_T_stage", "pathology_N_stage", "pathology_M_stage",
+                              "gender", "histological_type")]
+  
+  results_df <- results_df %>%
+    left_join(key_metadata, by = c("sample_id" = "patientID"))
+  
+  # 5. Add BOTH GSEA and GSVA pathways for Factor3
+  # GSVA pathways (from your correlation analysis)
+  gsva_pathways <- get_top_gsva_pathways()
+  gsva_data <- as.data.frame(t(ssgsea_hallmark[gsva_pathways, ]))
+  gsva_data$sample_id <- rownames(gsva_data)
+  
+  results_df <- results_df %>%
+    left_join(gsva_data, by = "sample_id")
+  
+  return(results_df)
+}
+
+# Get top GSVA pathways for Factor3 (including estrogen)
+get_top_gsva_pathways <- function() {
+  factor3_gsva <- hallmark_interpret[["Factor3"]]
+  
+  # Get top 5 positive and 5 negative pathways from GSVA
+  top_positive <- head(factor3_gsva$positive_pathways, 5)
+  top_negative <- head(factor3_gsva$negative_pathways, 5)
+  
+  return(c(top_positive, top_negative))
+}
+
+# Print comprehensive Factor3 interpretation
+print_factor3_interpretation <- function() {
+  cat("=== COMPREHENSIVE FACTOR3 INTERPRETATION ===\n\n")
+  
+  cat("GSEA RESULTS (Gene-level enrichment):\n")
+  cat("-------------------------------------\n")
+  cat("• Epithelial-mesenchymal transition (p=5.2e-29)\n")
+  cat("• Myogenesis (p=2.7e-11)\n")
+  cat("• Oxidative phosphorylation (p=3.1e-09)\n")
+  cat("• MYC targets V1 (p=3.0e-05)\n")
+  cat("• Apical junction (p=9.4e-05)\n")
+  cat("• Angiogenesis (p=3.8e-04)\n\n")
+  
+  cat("GSVA RESULTS (Pathway activity correlation):\n")
+  cat("--------------------------------------------\n")
+  cat("POSITIVE correlations:\n")
+  cat("• Epithelial-mesenchymal transition (r=0.23)\n")
+  cat("• Myogenesis (r=0.21)\n")
+  cat("• Angiogenesis (r=0.18)\n")
+  cat("• Apical junction (r=0.17)\n")
+  cat("• Coagulation (r=0.16)\n\n")
+  
+  cat("NEGATIVE correlations:\n")
+  cat("• ESTROGEN_RESPONSE_LATE (r=-0.21) ***\n")
+  cat("• Heme metabolism (r=-0.12)\n")
+  cat("• Spermatogenesis (r=-0.06)\n")
+  cat("• Allograft rejection (r=-0.06)\n")
+  cat("• Unfolded protein response (r=-0.05)\n\n")
+}
+
+# Enhanced cluster analysis
+run_factor3_cluster_analysis <- function() {
+  cat("=== FACTOR3 CLUSTER ANALYSIS ===\n\n")
+  
+  # Print pathway context first
+  print_factor3_interpretation()
+  
+  # 1. Get cluster data
+  cluster_data <- analyze_factor3_clusters()
+  
+  # 2. Analyze clinical differences
+  cat("CLINICAL DIFFERENCES BETWEEN CLUSTERS:\n")
+  cat("--------------------------------------\n")
+  analyze_clinical_differences(cluster_data)
+  
+  # 3. Analyze pathway differences
+  cat("\nPATHWAY DIFFERENCES BETWEEN CLUSTERS:\n")
+  cat("-------------------------------------\n")
+  pathway_diffs <- analyze_pathway_differences(cluster_data)
+  
+  # 4. Create visualizations
+  cat("\nGENERATING PLOTS...\n")
+  plots <- create_cluster_plots(cluster_data)
+  
+  return(list(
+    cluster_data = cluster_data,
+    pathway_differences = pathway_diffs,
+    plots = plots
+  ))
+}
+
+# Clinical differences analysis
+analyze_clinical_differences <- function(cluster_data) {
+  
+  # Test tumor tissue site (colon vs rectal)
+  if("tumor_tissue_site" %in% colnames(cluster_data)) {
+    site_table <- table(cluster_data$cluster, cluster_data$tumor_tissue_site)
+    print(site_table)
+    
+    fisher_p <- fisher.test(site_table)$p.value
+    cat("Tumor site Fisher p-value:", round(fisher_p, 4), "\n")
+  }
+}
+
+# Pathway differences analysis - focused on key pathways
+analyze_pathway_differences <- function(cluster_data) {
+  
+  # Focus on key pathways from both GSEA and GSVA
+  key_pathways <- c(
+    "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+    "HALLMARK_MYOGENESIS", 
+    "HALLMARK_ANGIOGENESIS",
+    "HALLMARK_ESTROGEN_RESPONSE_LATE",
+    "HALLMARK_OXIDATIVE_PHOSPHORYLATION"
+  )
+  
+  pathway_results <- data.frame()
+  
+  for(pathway in key_pathways) {
+    if(pathway %in% colnames(cluster_data)) {
+      cluster1_vals <- cluster_data[[pathway]][cluster_data$cluster == "Cluster1"]
+      cluster2_vals <- cluster_data[[pathway]][cluster_data$cluster == "Cluster2"]
+      
+      t_test <- t.test(cluster1_vals, cluster2_vals)
+      
+      pathway_results <- rbind(pathway_results, data.frame(
+        pathway = pathway,
+        cluster1_mean = mean(cluster1_vals, na.rm = TRUE),
+        cluster2_mean = mean(cluster2_vals, na.rm = TRUE),
+        mean_difference = mean(cluster1_vals, na.rm = TRUE) - mean(cluster2_vals, na.rm = TRUE),
+        p_value = t_test$p.value
+      ))
+    }
   }
   
-  top_embed_name <- top_embed$feature[1]
-  cat("Top embedding:", top_embed_name, "\n")
+  # Sort by significance
+  pathway_results <- pathway_results[order(pathway_results$p_value), ]
   
-  # Verify the embedding exists
-  if (!top_embed_name %in% colnames(embedding_matched_clean)) {
-    cat("ERROR: Embedding", top_embed_name, "not found!\n")
-    return(NULL)
-  }
+  # Print results
+  print(pathway_results)
   
-  # Create plot data
-  plot_data <- data.frame(
-    factor_score = factor_scores[, factor_name],
-    embedding_value = embedding_matched_clean[, top_embed_name]
-  )
+  return(pathway_results)
+}
+
+# Create focused visualizations
+create_cluster_plots <- function(cluster_data) {
+  library(ggplot2)
+  library(patchwork)
   
-  # Create plot
-  p <- ggplot(plot_data, aes(x = factor_score, y = embedding_value)) +
-    geom_point(alpha = 0.6) +
-    geom_smooth(method = "lm", color = "red") +
-    labs(
-      title = paste(factor_name, "vs", top_embed_name),
-      x = paste(factor_name, "Score"),
-      y = "Embedding Value"
-    ) +
+  plots <- list()
+  
+  # Plot 1: Basic cluster scatter
+  plots$scatter_basic <- ggplot(cluster_data, aes(x = factor_score, y = projection, color = cluster)) +
+    geom_point(alpha = 0.7, size = 2) +
+    labs(title = "Factor3: Two Distinct Clusters",
+         x = "MOFA Factor3 Score", 
+         y = "Embedding Projection") +
     theme_minimal()
   
-  # Calculate correlation
-  cor_result <- cor.test(plot_data$factor_score, plot_data$embedding_value)
-  
-  return(list(
-    factor = factor_name,
-    top_embedding = top_embed_name,
-    plot = p,
-    correlation = cor_result$estimate,
-    p_value = cor_result$p.value
-  ))
-}
-
-# =========================================================
-# TEST WITH FACTOR 1
-# =========================================================
-
-cat("\n=== TESTING FACTOR 1 ===\n")
-factor1_result <- analyze_factor_simple("Factor1")
-
-if (!is.null(factor1_result)) {
-  print(factor1_result$plot)
-  cat("Correlation:", round(factor1_result$correlation, 3), 
-      "(p =", format.pval(factor1_result$p_value, digits = 3), ")\n")
-} else {
-  cat("Failed to analyze Factor1\n")
-}
-
-# =========================================================
-# ANALYZE ALL FACTORS
-# =========================================================
-
-cat("\n=== ANALYZING ALL FACTORS ===\n")
-
-all_factors <- paste0("Factor", 1:15)
-results <- list()
-
-for (factor in all_factors) {
-  result <- analyze_factor_simple(factor)
-  if (!is.null(result)) {
-    results[[factor]] <- result
+  # Plot 2: Estrogen response by cluster (key finding)
+  if("HALLMARK_ESTROGEN_RESPONSE_LATE" %in% colnames(cluster_data)) {
+    plots$estrogen_boxplot <- ggplot(cluster_data, aes(x = cluster, y = HALLMARK_ESTROGEN_RESPONSE_LATE, fill = cluster)) +
+      geom_boxplot(alpha = 0.7) +
+      labs(title = "Key Finding: Estrogen Response by Cluster",
+           y = "Estrogen Response Activity") +
+      theme_minimal() +
+      theme(legend.position = "none")
   }
+  
+  # Plot 3: EMT by cluster (GSEA top pathway)
+  if("HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION" %in% colnames(cluster_data)) {
+    plots$emt_boxplot <- ggplot(cluster_data, aes(x = cluster, y = HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION, fill = cluster)) +
+      geom_boxplot(alpha = 0.7) +
+      labs(title = "GSEA Top Pathway: EMT by Cluster",
+           y = "EMT Activity") +
+      theme_minimal() +
+      theme(legend.position = "none")
+  }
+  
+  # Plot 4: Tumor site distribution
+  if("tumor_tissue_site" %in% colnames(cluster_data)) {
+    plots$site_bar <- ggplot(cluster_data, aes(x = cluster, fill = tumor_tissue_site)) +
+      geom_bar(position = "fill") +
+      labs(title = "Tumor Site Distribution by Cluster",
+           y = "Proportion") +
+      theme_minimal()
+  }
+  
+  return(plots)
 }
 
-# Create summary
-if (length(results) > 0) {
-  factor_summary <- map_dfr(results, function(res) {
-    tibble(
-      factor = res$factor,
-      top_embedding = res$top_embedding,
-      correlation = round(res$correlation, 3),
-      p_value = format.pval(res$p_value, digits = 3)
-    )
-  })
+# Run the analysis
+results <- run_factor3_cluster_analysis()
+
+# Display cluster summary
+cat("\nCLUSTER SUMMARY:\n")
+print(results$cluster_data %>% 
+        group_by(cluster) %>% 
+        summarise(
+          n_samples = n(),
+          avg_factor_score = mean(factor_score),
+          avg_projection = mean(projection)
+        ))
+
+# Show plots
+results$plots$scatter_basic
+if(!is.null(results$plots$estrogen_boxplot)) results$plots$estrogen_boxplot
+if(!is.null(results$plots$emt_boxplot)) results$plots$emt_boxplot  
+if(!is.null(results$plots$site_bar)) results$plots$site_bar
+```
+
+
+```{r}
+# Create focused visualizations
+create_focused_plots <- function(cluster_data) {
+  library(ggplot2)
+  library(patchwork)
   
-  print("=== FACTOR SUMMARY ===")
-  print(factor_summary)
-  
-  # Plot correlations
-  ggplot(factor_summary, aes(x = factor, y = correlation, fill = correlation)) +
-    geom_col() +
-    scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
-    labs(title = "MOFA Factors vs Top Embeddings Correlation",
-         x = "Factor", y = "Correlation") +
+  # Plot 1: Estrogen Response by Cluster (most significant)
+  p1 <- ggplot(cluster_data, aes(x = cluster, y = HALLMARK_ESTROGEN_RESPONSE_LATE, fill = cluster)) +
+    geom_boxplot(alpha = 0.7) +
+    labs(title = "Strongest Signal: Estrogen Response",
+         y = "Estrogen Response Activity") +
     theme_minimal() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-} else {
-  cat("No factors could be analyzed\n")
+    theme(legend.position = "none")
+  
+  # Plot 2: Angiogenesis by Cluster  
+  p2 <- ggplot(cluster_data, aes(x = cluster, y = HALLMARK_ANGIOGENESIS, fill = cluster)) +
+    geom_boxplot(alpha = 0.7) +
+    labs(title = "Angiogenesis Difference",
+         y = "Angiogenesis Activity") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  # Plot 3: Tumor stage distribution
+  p3 <- ggplot(cluster_data, aes(x = cluster, fill = pathologic_stage)) +
+    geom_bar(position = "fill") +
+    labs(title = "Stage Distribution by Cluster",
+         y = "Proportion") +
+    theme_minimal()
+  
+  # Plot 4: Tumor site by cluster
+  p4 <- ggplot(cluster_data, aes(x = cluster, fill = tumor_tissue_site)) +
+    geom_bar(position = "fill") +
+    labs(title = "Tumor Site by Cluster", 
+         y = "Proportion") +
+    theme_minimal()
+  
+  return((p1 + p2) / (p3 + p4))
 }
 
-# =========================================================
-# ALTERNATIVE: DIRECT INDEX APPROACH
-# =========================================================
-
-cat("\n=== ALTERNATIVE: DIRECT INDEX APPROACH ===\n")
-
-# If the above still doesn't work, let's try a completely different approach
-# Let's manually find the top embedding by index and map it
-
-# Get the original numeric index for Factor1's top embedding
-factor1_top_original <- embedding_weights %>%
-  filter(factor == "Factor1") %>%
-  arrange(desc(abs(value))) %>%
-  slice(1) %>%
-  pull(feature)
-
-cat("Original top embedding for Factor1:", as.character(factor1_top_original), "\n")
-
-# Since we know we have 768 embeddings numbered embed_1 to embed_768
-# Let's just test them all to find which one has the highest correlation with Factor1
-cat("\n=== BRUTE FORCE CORRELATION SEARCH ===\n")
-
-# Calculate correlation between Factor1 and all embeddings
-factor1_correlations <- sapply(1:768, function(i) {
-  embed_name <- paste0("embed_", i)
-  if (embed_name %in% colnames(embedding_matched_clean)) {
-    cor(factor_scores[, "Factor1"], embedding_matched_clean[, embed_name])
-  } else {
-    NA
-  }
-})
-
-# Find the embedding with highest absolute correlation
-max_corr_index <- which.max(abs(factor1_correlations))
-max_corr_embed <- paste0("embed_", max_corr_index)
-max_corr_value <- factor1_correlations[max_corr_index]
-
-cat("Embedding with highest correlation to Factor1:", max_corr_embed, "\n")
-cat("Correlation value:", round(max_corr_value, 3), "\n")
-
-# Plot this correlation
-plot_data <- data.frame(
-  factor_score = factor_scores[, "Factor1"],
-  embedding_value = embedding_matched_clean[, max_corr_embed]
-)
-
-ggplot(plot_data, aes(x = factor_score, y = embedding_value)) +
-  geom_point(alpha = 0.6) +
-  geom_smooth(method = "lm", color = "red") +
-  labs(
-    title = paste("Factor1 vs", max_corr_embed, "(Highest Correlation)"),
-    x = "Factor1 Score",
-    y = "Embedding Value"
-  ) +
-  theme_minimal()
-
-# =========================================================
-# FINAL WORKING SOLUTION
-# =========================================================
-
-# Since the MOFA weight mapping is problematic, let's use the correlation approach
-# This is actually more scientifically sound anyway
-
-cat("\n=== FINAL WORKING SOLUTION: CORRELATION-BASED ===\n")
-
-# Function to find best embedding for each factor via correlation
-find_best_embedding_for_factor <- function(factor_name) {
-  correlations <- sapply(1:768, function(i) {
-    embed_name <- paste0("embed_", i)
-    cor(factor_scores[, factor_name], embedding_matched_clean[, embed_name])
-  })
-  
-  best_index <- which.max(abs(correlations))
-  best_embed <- paste0("embed_", best_index)
-  best_corr <- correlations[best_index]
-  
-  return(list(
-    factor = factor_name,
-    best_embedding = best_embed,
-    correlation = best_corr
-  ))
-}
-
-# Analyze all factors
-final_results <- map(all_factors, find_best_embedding_for_factor)
-
-# Create final summary
-final_summary <- map_dfr(final_results, function(res) {
-  # Get top RNA genes for this factor
-  top_rna <- rna_weights %>%
-    filter(factor == res$factor) %>%
-    arrange(desc(abs(value))) %>%
-    head(5) %>%
-    pull(feature) %>%
-    paste(collapse = ", ")
-  
-  tibble(
-    factor = res$factor,
-    best_embedding = res$best_embedding,
-    correlation = round(res$correlation, 3),
-    top_rna_genes = top_rna
-  )
-})
-
-print("=== FINAL SUMMARY (CORRELATION-BASED) ===")
-print(final_summary)
-
-
+# Generate focused plots
+focused_plots <- create_focused_plots(results$cluster_data)
+print(focused_plots)
 ```
 
 
-# Visualize Correlations
-
-```{r}
-
-# Plot all correlations
-ggplot(final_summary, aes(x = factor, y = correlation, fill = correlation)) +
-  geom_col() +
-  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
-  labs(title = "MOFA Factors vs Best-Correlated Embeddings",
-       x = "Factor", y = "Correlation") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-
-
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-library(ggrepel)
-
-# =========================================================
-# ENHANCED PLOT WITH COMPLETE INFORMATION
-# =========================================================
-
-# First, let's create a more comprehensive summary that includes biological pathways
-enhanced_summary <- final_summary %>%
-  # Add pathway information from GSEA results
-  left_join(
-    map_dfr(all_factors, function(factor_name) {
-      # Get GSEA results for this factor
-      factor_ranks <- rna_weights %>%
-        filter(factor == factor_name) %>%
-        select(feature, value) %>%
-        deframe()
-      factor_ranks <- sort(factor_ranks, decreasing = TRUE)
-      
-      # Run GSEA on hallmark pathways
-      gsea_res <- fgsea(pathways_hallmark, factor_ranks, 
-                       minSize = 15, maxSize = 500)
-      
-      # Get top positive and negative pathways
-      top_pos <- gsea_res %>% 
-        filter(NES > 0) %>% 
-        arrange(pval) %>% 
-        slice(1)
-      top_neg <- gsea_res %>% 
-        filter(NES < 0) %>% 
-        arrange(pval) %>% 
-        slice(1)
-      
-      tibble(
-        factor = factor_name,
-        top_positive_pathway = ifelse(nrow(top_pos) > 0, top_pos$pathway, NA),
-        top_negative_pathway = ifelse(nrow(top_neg) > 0, top_neg$pathway, NA),
-        top_pathway_pval = ifelse(nrow(top_pos) > 0, top_pos$pval, NA)
-      )
-    }),
-    by = "factor"
-  ) %>%
-  # Create cleaner pathway names (remove HALLMARK_ prefix)
-  mutate(
-    top_positive_pathway_clean = gsub("HALLMARK_", "", top_positive_pathway),
-    top_negative_pathway_clean = gsub("HALLMARK_", "", top_negative_pathway),
-    # Create a combined biological interpretation
-    biological_interpretation = case_when(
-      !is.na(top_positive_pathway) & !is.na(top_negative_pathway) ~ 
-        paste0("Pos: ", top_positive_pathway_clean, "\nNeg: ", top_negative_pathway_clean),
-      !is.na(top_positive_pathway) ~ paste0("Pos: ", top_positive_pathway_clean),
-      !is.na(top_negative_pathway) ~ paste0("Neg: ", top_negative_pathway_clean),
-      TRUE ~ "No significant pathways"
-    )
-  )
-
-# =========================================================
-# PLOT 1: DETAILED CORRELATION BAR PLOT
-# =========================================================
-
-p1 <- ggplot(enhanced_summary, 
-             aes(x = reorder(factor, correlation), 
-                 y = correlation, 
-                 fill = correlation)) +
-  geom_col(width = 0.7) +
-  # Add correlation value labels
-  geom_text(aes(label = sprintf("%.3f", correlation), 
-                y = ifelse(correlation > 0, correlation + 0.05, correlation - 0.05)),
-            size = 3, fontface = "bold") +
-  # Add embedding labels
-  geom_text(aes(label = best_embedding, 
-                y = ifelse(correlation > 0, -0.15, 0.15)),
-            size = 2.8, color = "darkblue", fontface = "italic") +
-  scale_fill_gradient2(
-    low = "blue", 
-    mid = "white", 
-    high = "red", 
-    midpoint = 0,
-    name = "Correlation\nStrength"
-  ) +
-  labs(
-    title = "MOFA Factors vs Best-Correlated Image Embeddings",
-    subtitle = "Top: Correlation values | Bottom: Embedding dimension names",
-    x = "MOFA Factors (ordered by correlation strength)",
-    y = "Correlation Coefficient",
-    caption = paste("Analysis includes", nrow(enhanced_summary), 
-                   "factors with their best-matching embedding dimensions")
-  ) +
-  theme_minimal() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
-    axis.text.y = element_text(size = 9),
-    plot.title = element_text(face = "bold", size = 14),
-    plot.subtitle = element_text(size = 10, color = "gray50"),
-    legend.position = "right",
-    panel.grid.major = element_line(color = "gray90"),
-    panel.grid.minor = element_blank()
-  ) +
-  # Ensure we have enough space for labels
-  scale_y_continuous(expand = expansion(mult = c(0.2, 0.2)))
-
-print(p1)
-
-# =========================================================
-# PLOT 2: BUBBLE PLOT WITH BIOLOGICAL CONTEXT
-# =========================================================
-
-# Create a more comprehensive visualization
-p2 <- ggplot(enhanced_summary, 
-             aes(x = reorder(factor, correlation), 
-                 y = correlation)) +
-  # Points sized by absolute correlation
-  geom_point(aes(size = abs(correlation), 
-                 color = correlation,
-                 fill = correlation), 
-             shape = 21, stroke = 1.5) +
-  # Add embedding labels with repulsion
-  geom_text_repel(
-    aes(label = best_embedding),
-    size = 3,
-    box.padding = 0.5,
-    segment.color = "gray50",
-    min.segment.length = 0
-  ) +
-  # Add correlation values
-  geom_text(
-    aes(label = sprintf("%.3f", correlation),
-        y = ifelse(correlation > 0, correlation + 0.08, correlation - 0.08)),
-    size = 2.5,
-    fontface = "bold"
-  ) +
-  scale_size_continuous(
-    range = c(3, 10),
-    name = "|Correlation|"
-  ) +
-  scale_color_gradient2(
-    low = "blue", 
-    mid = "gray", 
-    high = "red", 
-    midpoint = 0,
-    name = "Correlation\nDirection"
-  ) +
-  scale_fill_gradient2(
-    low = "blue", 
-    mid = "white", 
-    high = "red", 
-    midpoint = 0,
-    name = "Correlation\nDirection"
-  ) +
-  labs(
-    title = "Multi-Modal Integration: MOFA Factors vs Image Embeddings",
-    subtitle = "Bubble size = Correlation strength | Color = Direction",
-    x = "MOFA Factors",
-    y = "Correlation Coefficient",
-    caption = "Labels show the specific embedding dimension with highest correlation"
-  ) +
-  theme_minimal() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
-    axis.text.y = element_text(size = 9),
-    plot.title = element_text(face = "bold", size = 14),
-    plot.subtitle = element_text(size = 10, color = "gray50"),
-    legend.position = "right",
-    panel.grid.major = element_line(color = "gray90")
-  ) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50")
-
-print(p2)
-
-# =========================================================
-# PLOT 3: FACETED PLOT WITH BIOLOGICAL PATHWAYS
-# =========================================================
-
-# Create a long format for faceting
-facet_data <- enhanced_summary %>%
-  select(factor, correlation, best_embedding, 
-         top_positive_pathway_clean, top_negative_pathway_clean,
-         top_rna_genes) %>%
-  mutate(
-    # Shorten RNA genes for display
-    top_rna_genes_short = sapply(strsplit(top_rna_genes, ", "), function(x) {
-      paste(head(x, 3), collapse = ", ")
-    }),
-    # Create factor label with embedding
-    factor_label = paste0(factor, "\n(", best_embedding, ")")
-  )
-
-p3 <- ggplot(facet_data, aes(x = 1, y = correlation, fill = correlation)) +
-  geom_col() +
-  geom_text(aes(label = sprintf("r = %.3f", correlation)), 
-            vjust = ifelse(facet_data$correlation > 0, -0.5, 1.2),
-            size = 3, fontface = "bold") +
-  facet_wrap(~ reorder(factor_label, correlation), ncol = 5) +
-  scale_fill_gradient2(
-    low = "blue", mid = "white", high = "red", midpoint = 0,
-    guide = "none"  # Remove legend for cleaner look
-  ) +
-  labs(
-    title = "Detailed View: MOFA Factor Correlations with Biological Context",
-    subtitle = "Each panel shows one MOFA factor and its best-correlated embedding",
-    x = NULL,
-    y = "Correlation Coefficient"
-  ) +
-  theme_minimal() +
-  theme(
-    axis.text.x = element_blank(),
-    axis.ticks.x = element_blank(),
-    strip.text = element_text(face = "bold", size = 9),
-    panel.spacing = unit(1, "lines"),
-    plot.title = element_text(face = "bold", size = 14),
-    plot.subtitle = element_text(size = 10, color = "gray50")
-  ) +
-  # Add biological context as annotations
-  geom_text(
-    data = facet_data,
-    aes(x = 1, y = ifelse(correlation > 0, -0.3, 0.3),
-        label = top_positive_pathway_clean),
-    size = 2.2, color = "darkgreen", fontface = "italic"
-  )
-
-print(p3)
-
-# =========================================================
-# PLOT 4: HEATMAP-STYLE VISUALIZATION
-# =========================================================
-
-# Create a matrix for heatmap
-correlation_matrix <- final_summary %>%
-  select(factor, best_embedding, correlation) %>%
-  mutate(
-    embedding_num = as.numeric(gsub("embed_", "", best_embedding))
-  ) %>%
-  arrange(embedding_num)
-
-p4 <- ggplot(correlation_matrix, 
-             aes(x = factor, y = best_embedding, fill = correlation)) +
-  geom_tile(color = "white", size = 0.5) +
-  geom_text(aes(label = sprintf("%.3f", correlation)), 
-            color = "white", size = 3, fontface = "bold") +
-  scale_fill_gradient2(
-    low = "blue", mid = "white", high = "red", midpoint = 0,
-    name = "Correlation"
-  ) +
-  labs(
-    title = "Heatmap: MOFA Factor - Embedding Correlations",
-    subtitle = "Each cell shows correlation between a factor and its best-matching embedding",
-    x = "MOFA Factors",
-    y = "Best-Matching Embedding Dimensions"
-  ) +
-  theme_minimal() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
-    axis.text.y = element_text(size = 8),
-    plot.title = element_text(face = "bold", size = 14),
-    panel.grid = element_blank()
-  )
-
-print(p4)
-
-
-# =========================================================
-# INTERACTIVE PLOT (if you have plotly)
-# =========================================================
-
-# Uncomment if you want interactive plots
-# library(plotly)
-# 
-# interactive_plot <- ggplot(enhanced_summary,
-#                           aes(x = reorder(factor, correlation), 
-#                               y = correlation,
-#                               text = paste("Factor:", factor,
-#                                           "<br>Embedding:", best_embedding,
-#                                           "<br>Correlation:", round(correlation, 3),
-#                                           "<br>Top Pathway:", top_positive_pathway_clean,
-#                                           "<br>Top Genes:", top_rna_genes))) +
-#   geom_col(aes(fill = correlation)) +
-#   scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
-#   labs(title = "Interactive: MOFA Factors vs Embeddings",
-#        x = "Factor", y = "Correlation") +
-#   theme_minimal() +
-#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
-# 
-# ggplotly(interactive_plot, tooltip = "text")
-
-# =========================================================
-# PRINT KEY INSIGHTS
-# =========================================================
-
-cat("\n=== KEY INSIGHTS ===\n")
-cat("Strongest positive correlation:", 
-    enhanced_summary$factor[which.max(enhanced_summary$correlation)], 
-    "with", enhanced_summary$best_embedding[which.max(enhanced_summary$correlation)],
-    "(r =", round(max(enhanced_summary$correlation), 3), ")\n")
-
-cat("Strongest negative correlation:", 
-    enhanced_summary$factor[which.min(enhanced_summary$correlation)], 
-    "with", enhanced_summary$best_embedding[which.min(enhanced_summary$correlation)],
-    "(r =", round(min(enhanced_summary$correlation), 3), ")\n")
-
-cat("Most frequently associated embedding:",
-    names(which.max(table(enhanced_summary$best_embedding))), "\n")
-
-cat("Average absolute correlation:",
-    round(mean(abs(enhanced_summary$correlation)), 3), "\n")
-```
-
-```{r}
-
-# =========================================================
-# Embedding correlations with factors + gsea interpretations
-# =========================================================
-
-cat("\n=== COMPREHENSIVE FACTOR-EMBEDDING SUMMARY ===\n")
-
-embedding_corr_table <- enhanced_summary %>%
-  select(
-    Factor = factor,
-    `Best Embedding` = best_embedding,
-    Correlation = correlation,
-    `Top Positive Pathway` = top_positive_pathway_clean,
-    `Top Negative Pathway` = top_negative_pathway_clean,
-    `Top RNA Genes` = top_rna_genes
-  ) %>%
-  arrange(desc(abs(Correlation)))
-
-print(embedding_corr_table)
-
-# Save as CSV for further analysis
-write.csv(comprehensive_table, "mofa_factor_embedding_analysis.csv", row.names = FALSE)
-```
 
 
 
 
 # Gene set Analysis
 
-
-	•	GSEA (Subramanian et al., 2005) > standard for testing global enrichment. (FGSEA fast preranked gene set enrichment analysis)
-	•	GSVA (Hänzelmann et al., 2013) > extends this by providing sample-wise enrichment scores, enabling downstream associations with phenotypes or latent factors.
-
+```         
+•   GSEA (Subramanian et al., 2005) > standard for testing global enrichment. (FGSEA fast preranked gene set enrichment analysis)
+•   GSVA (Hänzelmann et al., 2013) > extends this by providing sample-wise enrichment scores, enabling downstream associations with phenotypes or latent factors.
+```
 
 ## Gene sets
 
@@ -1149,9 +653,8 @@ pathways_c2 <- msigdbr(species = "Homo sapiens", collection = "C2") %>%
 
 ```
 
-
-
 ## Run FGSEA
+
 ```{r}
 
 ## Run FGSEA for all factors
@@ -1194,33 +697,33 @@ for(factor_id in unique(all_weights$factor)) {
 
 
 # Check any of the gene sets with factors
-factor_interpretation$Factor1$hallmark_top
+factor_interpretation$Factor3$c2_top
 
 ```
 
 **Explanation of GSEA output (fgsea):**
 
-- **pathway** – Name of the gene set tested (e.g., Hallmark pathways).  
-- **pval** – Raw p-value from the enrichment test.  
-- **padj** – Adjusted p-value (FDR corrected).  
-- **ES (Enrichment Score)** – Degree to which a gene set is overrepresented at the top or bottom of the ranked list.  
-- **NES (Normalized Enrichment Score)** – Enrichment score normalized for gene set size, used to compare across gene sets.  
-- **size** – Number of genes in the pathway that overlap with the ranked list.  
-- **leadingEdge** – Subset of genes that contribute most to the enrichment signal. 
+-   **pathway** – Name of the gene set tested (e.g., Hallmark pathways).\
 
+-   **pval** – Raw p-value from the enrichment test.\
 
-- Hallmark pathways from the GSEA results, ranked by normalized enrichment score (NES), with bars colored by whether the adjusted p-value (FDR) is significant (< 0.05).
+-   **padj** – Adjusted p-value (FDR corrected).\
 
-- MYC targets (V1, V2), E2F targets, and KRAS signaling are strongly negatively enriched, suggesting suppression of cell-cycle–related and oncogenic signaling programs in the context of the factors identified by MOFA. 
-  * MYC is a master regulator of proliferation, metabolism, and growth (Dang, Cell, 2012).
+-   **ES (Enrichment Score)** – Degree to which a gene set is overrepresented at the top or bottom of the ranked list.\
 
+-   **NES (Normalized Enrichment Score)** – Enrichment score normalized for gene set size, used to compare across gene sets.\
 
-- epithelial–mesenchymal transition (EMT), inflammatory response, interferon gamma response, and allograft rejection. This points to activation of immune and stromal programs.
+-   **size** – Number of genes in the pathway that overlap with the ranked list.\
 
+-   **leadingEdge** – Subset of genes that contribute most to the enrichment signal.
 
+-   Hallmark pathways from the GSEA results, ranked by normalized enrichment score (NES), with bars colored by whether the adjusted p-value (FDR) is significant (\< 0.05).
 
+-   MYC targets (V1, V2), E2F targets, and KRAS signaling are strongly negatively enriched, suggesting suppression of cell-cycle–related and oncogenic signaling programs in the context of the factors identified by MOFA.
 
+    -   MYC is a master regulator of proliferation, metabolism, and growth (Dang, Cell, 2012).
 
+-   epithelial–mesenchymal transition (EMT), inflammatory response, interferon gamma response, and allograft rejection. This points to activation of immune and stromal programs.
 
 ## Factor Enrichment plot
 
@@ -1234,11 +737,10 @@ if(!is.null(enrichment_plot)) {
 }
 ```
 
-* GSEA identified HALLMARK_MYC_TARGETS_V1 as one of the most significantly enriched pathways (FDR q < 1e-28), indicating a central role of MYC-driven transcriptional programs in our dataset. Complementarily, GSVA revealed that MYC target activity varies across samples and is negatively correlated with MOFA Factor 1, suggesting that MYC activation is antagonistic to the biological processes captured by this factor. 
-
-
+-   GSEA identified HALLMARK_MYC_TARGETS_V1 as one of the most significantly enriched pathways (FDR q \< 1e-28), indicating a central role of MYC-driven transcriptional programs in our dataset. Complementarily, GSVA revealed that MYC target activity varies across samples and is negatively correlated with MOFA Factor 1, suggesting that MYC activation is antagonistic to the biological processes captured by this factor.
 
 ## Run GSVA
+
 ```{r}
 # Extract RNA-seq expression from MOFA
 rna_se <- get_data(mofa_object.trained, view = "RNASeq")[[1]]  # first group if multiple
@@ -1300,12 +802,7 @@ c6_interpret <- interpret_factors(c6_cor, pathways_c6)
 
 ```
 
-
-
-
 # Latent Factor Visualization
-
-
 
 ## geom_col plot
 
@@ -1316,7 +813,7 @@ c6_interpret <- interpret_factors(c6_cor, pathways_c6)
 plot_factor_separate <- function(factor_id,
                                  gsea_collection = "hallmark",
                                  gsva_collection = "hallmark",
-                                 max_pathways = 10) {
+                                 max_pathways = 20) {
   
   plots <- list()
   
@@ -1367,18 +864,15 @@ for (f in top_factors) {
 }
 ```
 
-
-
-
 ## Heatmap plot
 
-
 ```{r}
+library(RColorBrewer)
 # GSEA heatmap for Hallmark pathways
-plot_gsea_heatmap("hallmark", top_n_pathways = 30)
+plot_gsea_heatmap("hallmark", top_n_pathways = 40)
 
 # GSVA heatmap for Hallmark pathways
-plot_gsva_heatmap("hallmark", top_n_pathways = 20)
+plot_gsva_heatmap("hallmark", top_n_pathways = 30)
 
 # You can switch to "c2" or "c6"
 plot_gsea_heatmap("c2", top_n_pathways = 20)
@@ -1388,13 +882,12 @@ plot_gsva_heatmap("c2", top_n_pathways = 20)
 
 ```
 
-
 # Table
 
 ```{r}
 # ---- Integrated interpret_factor function ----
 interpret_factor <- function(factor_id,
-                             top_n_pathways = 5,
+                             top_n_pathways = 10,
                              top_n_genes = 10,
                              gsva_collections = c("hallmark","c2","c6"),
                              gsea_collections = c("hallmark","c2","c6")) {
@@ -1490,9 +983,14 @@ create_summary_table <- function(factor_ids = paste0("Factor", 1:10),
         
         # Get top correlations
         if(length(cor_vec) > 0 && !is.null(names(cor_vec))) {
-          top_cor <- head(sort(cor_vec, decreasing = TRUE), top_n_pathways)
-          gsva_cols[col_name] <- paste(names(top_cor), "[cor=", signif(top_cor, 2), "]", collapse = "; ")
-        }
+  cor_vec <- suppressWarnings(as.numeric(cor_vec))
+  names(cor_vec) <- names(out$gsva_summary[[col]])  # restore names if lost
+  cor_vec <- cor_vec[!is.na(cor_vec)]
+  if(length(cor_vec) > 0) {
+    top_cor <- head(sort(cor_vec, decreasing = TRUE), top_n_pathways)
+    gsva_cols[col_name] <- paste(names(top_cor), "[cor=", signif(top_cor, 2), "]", collapse = "; ")
+  }
+}
       }
     }
     
@@ -1553,9 +1051,6 @@ all_factors_table <- create_summary_table(
 
 ```
 
-
-
-
 # Interpretation Report
 
 ```{r}
@@ -1583,7 +1078,7 @@ writeLines(c(
   "  fig.align = 'center',",
   "  fig.width = 7, fig.height = 5,",
   "  out.width = '100%',",
-  "  fig.show = 'asis'   # ensure plots are printed one below the other",
+  "  fig.show = 'asis'",
   ")",
   "library(kableExtra)",
   "library(dplyr)",
@@ -1592,69 +1087,76 @@ writeLines(c(
   "library(ggplot2)",
   "```",
   "",
-"<style>",
-"@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Merriweather:wght@400;700&display=swap');",
+  "<style>",
+  "@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Merriweather:wght@400;700&display=swap');",
+  "",
+  "body {",
+  "  font-family: 'Roboto', sans-serif;",
+  "  line-height: 1.7;",
+  "  color: #2c3e50;",
+  "  background-color: #fafafa;",
+  "  max-width: 1100px;",
+  "  margin: auto;",
+  "  padding: 20px;",
+  "}",
+  "h1, h2, h3 {",
+  "  font-family: 'Merriweather', serif;",
+  "  color: #1a5276;",
+  "  margin-top: 2em;",
+  "  padding-bottom: 0.3em;",
+  "  border-bottom: 2px solid #5dade2;",
+  "}",
+  "table {",
+  "  border-collapse: collapse;",
+  "  margin: 1em 0;",
+  "}",
+  "th {",
+  "  background-color: #5dade2;",
+  "  color: #fff;",
+  "  padding: 8px;",
+  "  text-align: left;",
+  "}",
+  "td {",
+  "  padding: 8px;",
+  "  border-bottom: 1px solid #ddd;",
+  "}",
+  ".table-caption {",
+  "  font-weight: 600;",
+  "  font-size: 1.1em;",
+  "  color: #34495e;",
+  "  margin-bottom: 8px;",
+  "}",
+  "code, pre {",
+  "  font-family: 'Fira Code', monospace;",
+  "  background-color: #f4f6f6;",
+  "  padding: 2px 6px;",
+  "  border-radius: 4px;",
+  "}",
+  "</style>",
+  "",
+"# Introduction",
 "",
-"body {",
-"  font-family: 'Roboto', sans-serif;",
-"  line-height: 1.7;",
-"  color: #2c3e50;",
-"  background-color: #fafafa;",
-"  max-width: 1100px;",
-"  margin: auto;",
-"  padding: 20px;",
-"}",
-"h1, h2, h3 {",
-"  font-family: 'Merriweather', serif;",
-"  color: #1a5276;",
-"  margin-top: 2em;",
-"  padding-bottom: 0.3em;",
-"  border-bottom: 2px solid #5dade2;",
-"}",
-"table {",
-"  border-collapse: collapse;",
-"  margin: 1em 0;",
-"}",
-"th {",
-"  background-color: #5dade2;",
-"  color: #fff;",
-"  padding: 8px;",
-"  text-align: left;",
-"}",
-"td {",
-"  padding: 8px;",
-"  border-bottom: 1px solid #ddd;",
-"}",
-".table-caption {",
-"  font-weight: 600;",
-"  font-size: 1.1em;",
-"  color: #34495e;",
-"  margin-bottom: 8px;",
-"}",
-"code, pre {",
-"  font-family: 'Fira Code', monospace;",
-"  background-color: #f4f6f6;",
-"  padding: 2px 6px;",
-"  border-radius: 4px;",
-"}",
-"</style>",
-  "",
-  "# Introduction",
-  "",
-  "MOFA identifies latent factors that capture coordinated variation across multi-omics datasets. This analysis interprets these factors through their associations with well-curated biological pathways from MSigDB.",
-  "",
-  "# Data Sources and Analytical Pipeline",
-  "- **MOFA Model**: Trained on multi-omics views: Prov-GigaPath WSI Embedding and RNAseq data",
-  "- **Pathway Databases**: MSigDB Hallmark, C2 (Curated), C6 (Oncogenic)",
-  "- **Analysis Methods**: GSEA (preranked), GSVA (sample-level)",
-  "- **Pipeline**:",
-  "  1. Extract factor weights from MOFA model",
-  "  2. Perform preranked GSEA on factor loadings",
-  "  3. Calculate pathway activity scores using GSVA",
-  "  4. Correlate factors with pathway activities",
-  "",
+"Using processed whole slide images (WSIs) from ProviGigaPath, we extracted image embeddings to numerically represent visual tissue features. These embeddings were matched to curated TCGA multi-omics data, including RNA-seq, allowing integration of histology and molecular profiles.",
+"",
+"MOFA (Multi-Omics Factor Analysis) was applied to jointly analyze the embeddings and molecular data, identifying latent factors that capture shared variation across modalities. We then correlated embedding weights with factor loadings to determine which visual features aligned with specific latent factors.",
+"",
+"Biological interpretation was achieved by applying FGSEA (Fast Gene Set Enrichment Analysis) and GSVA (Gene Set Variation Analysis) to the RNA-seq factor loadings, uncovering pathways associated with each factor. This pipeline systematically links histology image patterns to molecular mechanisms in an interpretable way.",
+"",
+"# Data Sources and Analytical Pipeline",
+"- **MOFA Model**: Trained on multi-omics views: Prov-GigaPath WSI Embedding and RNAseq data",
+"- **Pathway Databases**: MSigDB Hallmark, C2 (Curated), C6 (Oncogenic)",
+"- **Analysis Methods**: GSEA (preranked), GSVA (sample-level)",
+"- **Pipeline**:",
+"  1. Extract factor weights from MOFA model",
+"  2. Perform preranked GSEA on factor loadings",
+"  3. Calculate pathway activity scores using GSVA",
+"  4. Correlate factors with pathway activities",
+"",
   "# Latent Factor Visualization",
   "",
+  "## MOFA output",
+  "```{r factor-plots, fig.width=12, fig.height=8}",
+  "print(plot_variance_explained(mofa_object.trained, plot_total = TRUE))",
   "## Heatmaps",
   "```{r heatmap-plots, fig.width=12, fig.height=10}",
   "if (exists('plot_gsea_heatmap')) {",
@@ -1686,51 +1188,83 @@ writeLines(c(
   "}",
   "```",
   "",
-  "## Embedding Correlation Summary",
+  "## Embedding–Factor Correlation Table",
   "",
-  "```{r embedding-correlation-table, results='asis'}",
-  "if (exists('enhanced_summary')) {",
-  "  comprehensive_table <- enhanced_summary %>%",
-  "    select(",
-  "      Factor = factor,",
-  "      `Best Embedding` = best_embedding,",
-  "      Correlation = correlation,",
-  "      `Top Positive Pathway` = top_positive_pathway_clean,",
-  "      `Top Negative Pathway` = top_negative_pathway_clean,",
-  "      `Top RNA Genes` = top_rna_genes",
-  "    ) %>%",
-  "    arrange(desc(abs(Correlation)))",
+  "```{r embedding-factor-correlation, results='asis'}",
+  "if (exists('embedding_corr_table')) {",
+  "  top_corr_table <- embedding_corr_table %>%",
+  "    group_by(Factor) %>%",
+  "    slice_max(order_by = Abs_Corr, n = 20) %>%",
+  "    ungroup()",
   "",
-  "  kable(comprehensive_table, format = 'html', escape = FALSE,",
-  "        caption = '<strong>Table 2: Correlations Between MOFA Factors and Image Embeddings</strong>') %>%",
+  "  kable(top_corr_table, format = 'html', escape = FALSE,",
+  "        caption = '<strong>Table 3: Top Correlated Embeddings per Factor</strong>') %>%",
   "    kable_styling(",
   "      bootstrap_options = c('striped', 'hover', 'condensed'),",
   "      full_width = TRUE,",
   "      font_size = 12,",
   "      position = 'center'",
   "    ) %>%",
-  "    column_spec(1, bold = TRUE, width = '100px') %>%",
-  "    column_spec(2, width = '150px') %>%",
-  "    column_spec(3, width = '100px') %>%",
-  "    column_spec(4:6, width = '250px') %>%",
   "    scroll_box(width = '100%', height = '500px')",
   "}",
   "```",
   "",
+  "## MOFA Embedding Weight Table",
+  "",
+  "```{r embedding-weight-table, results='asis'}",
+  "if (exists('embedding_weight_table')) {",
+  "  kable(embedding_weight_table, format = 'html', escape = FALSE,",
+  "        caption = '<strong>Table 4: Top Weighted Embeddings per Factor (from MOFA Model)</strong>') %>%",
+  "    kable_styling(",
+  "      bootstrap_options = c('striped', 'hover', 'condensed'),",
+  "      full_width = TRUE,",
+  "      font_size = 12,",
+  "      position = 'center'",
+  "    ) %>%",
+  "    scroll_box(width = '100%', height = '500px')",
+  "}",
+  "```",
+  "",
+   "## Embedding–Factor Projection Plots for Factors 1, 3, 5",
+  "```{r embedding-projections, fig.width=7, fig.height=5}",
+  "selected_factors <- c('Factor1', 'Factor3', 'Factor5')",
+  "Xs <- scale(as.matrix(embedding_matched))",
+  "Ys <- scale(as.matrix(factor_scores_matched[, -1]))",
+  "W  <- as.matrix(embedding_weights)",
+  "for (j in selected_factors) {",
+  "  w_j <- W[, j]",
+  "  proj_wj <- Xs %*% w_j",
+  "  cor_val <- cor(proj_wj, Ys[, j])",
+  "  plot(Ys[, j], proj_wj,",
+  "       xlab = paste('MOFA factor', j, 'score'),",
+  "       ylab = 'Projection on embedding weights',",
+  "       main = paste('Embedding–Factor association:', j, '\\nCorrelation =', round(cor_val, 3)),",
+  "       pch = 16, col = 'gray40')",
+  "  abline(lm(proj_wj ~ Ys[, j]), col = 'red', lwd = 2)",
+  "}",
+  "```",
+  "",
+  "```{r embedding-weights-heatmap, fig.width=8, fig.height=6}",
+  "heatmap(W[, selected_factors], scale = 'row',",
+  "        xlab = 'Selected MOFA factors',",
+  "        ylab = 'Embedding dimensions',",
+  "        main = 'Embedding–Factor weight structure (Factors 1, 3, 5)')",
+  "```",
   "## Factor Enrichment Plots",
   "```{r factor-enrichment, fig.width=12, fig.height=12}",
   "top_n_enrichment <- 3",
-  "for(f in top_factors) {",
-  "  enrichment_plot <- plot_factor_enrichment(f, pathway_collection='hallmark', top_n=top_n_enrichment, all_weights=all_weights)",
-  "  if(!is.null(enrichment_plot)) print(enrichment_plot[[1]])",
+  "if (exists('top_factors')) {",
+  "  for(f in top_factors) {",
+  "    enrichment_plot <- plot_factor_enrichment(f, pathway_collection='hallmark', top_n=top_n_enrichment, all_weights=all_weights)",
+  "    if(!is.null(enrichment_plot)) print(enrichment_plot[[1]])",
+  "  }",
   "}",
   "```"
 ), con = rmd_html)
-
+library("kableExtra")
 # Render HTML
-rmarkdown::render(rmd_html ,output_file = "MOFA_factor_summary.html")
+rmarkdown::render(rmd_html ,output_file = "MOFA_factor_summary_T2.html")
 ```
-
 
 ```{r}
 # =========================================================
@@ -1830,19 +1364,13 @@ writeLines(c(
 rmarkdown::render(rmd_html, output_file = "MOFA_factor_summarys.html")
 ```
 
-
-
-* Factor 1 represents a proliferative, MYC-driven program enriched for E2F targets, KRAS signaling, and EMT pathways, reflecting high cell-cycle activity and transcriptional programs associated with tumor growth. In the context of colorectal cancer, it likely marks aggressive, mesenchymal-like tumors with enhanced proliferation, invasion, and metastatic potential.
-
-
+-   Factor 1 represents a proliferative, MYC-driven program enriched for E2F targets, KRAS signaling, and EMT pathways, reflecting high cell-cycle activity and transcriptional programs associated with tumor growth. In the context of colorectal cancer, it likely marks aggressive, mesenchymal-like tumors with enhanced proliferation, invasion, and metastatic potential.
 
 #### Surv analysis
 
-* The clinical features have 5 dimensions: T stage, N stage, M stage, total stage, and whether or not to receive chemotherapy after surgery [1]
+-   The clinical features have 5 dimensions: T stage, N stage, M stage, total stage, and whether or not to receive chemotherapy after surgery \[1\]
 
-[1] Cai, C., Zhou, Y., Jiao, Y. et al. Prognostic Analysis Combining Histopathological Features and Clinical Information to Predict Colorectal Cancer Survival from Whole-Slide Images. Dig Dis Sci 69, 2985–2995 (2024). https://doi-org.ccny-proxy1.libr.ccny.cuny.edu/10.1007/s10620-024-08501-x
-
-
+\[1\] Cai, C., Zhou, Y., Jiao, Y. et al. Prognostic Analysis Combining Histopathological Features and Clinical Information to Predict Colorectal Cancer Survival from Whole-Slide Images. Dig Dis Sci 69, 2985–2995 (2024). https://doi-org.ccny-proxy1.libr.ccny.cuny.edu/10.1007/s10620-024-08501-x
 
 ```{r}
 # ==============================
@@ -1913,6 +1441,7 @@ meta2 <- cbind(meta2, cand_pathways_df)
 ```
 
 #### Univariable Cox regression
+
 ```{r}
 # -----------------------------
 # 5. Define candidate variables
@@ -1945,6 +1474,7 @@ univ_results
 ```
 
 #### Multivariable Cox regression
+
 ```{r}
 # -----------------------------
 # 7. Multivariable Cox regression
@@ -1970,5 +1500,3 @@ cox_formula <- as.formula(paste0("Surv(time, event) ~ ", paste(mv_vars, collapse
 cox_mv <- coxph(cox_formula, data = meta2_std)
 summary(cox_mv)
 ```
-
-
