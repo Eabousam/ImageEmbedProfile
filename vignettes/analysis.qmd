@@ -113,7 +113,6 @@ read_mae <- curatedTCGAData(
 rna_coad <- coad_mae[["COAD_RNASeq2GeneNorm-20160128"]]
 rna_read <- read_mae[["READ_RNASeq2GeneNorm-20160128"]]
 
-colData(coad_mae)
 
 ```
 # Prepare summarise experiment objects
@@ -190,11 +189,19 @@ metadata_df <- clinical_sub[rownames(clinical_sub) %in% patients_with_embed, , d
 #------------------------------------------
 # 6. Match RNASeq to patients with embeddings
 #------------------------------------------
-rna_matched <- rna_combined[, colnames(rna_combined) %in% rownames(metadata_df), drop = FALSE]
+# Subset to matching samples (columns)
+rna_matched <- rna_combined[, colnames(rna_combined) %in% rownames(metadata_df)]
 
-# Remove genes with non-finite values
-rna_keep <- apply(rna_matched, 1, function(x) all(is.finite(x)))
-rna_matched_clean <- rna_matched[rna_keep, , drop = FALSE]
+# Extract the actual numeric expression matrix from the assay
+rna_matched_mat <- assay(rna_matched)
+
+# Check dimensions
+dim(rna_matched_mat)
+# should be genes × samples, e.g., 17995 × 606
+
+# Remove genes with any non-finite values (NA, Inf, -Inf)
+rna_keep <- apply(rna_matched_mat, 1, function(x) all(is.finite(x)))
+rna_matched_clean <- rna_matched_mat[rna_keep, ]
 
 #------------------------------------------
 # 7. Create SummarizedExperiment objects for each embedding layer
@@ -251,10 +258,10 @@ metadata_mae <- metadata_df[colnames(rna_se), , drop = FALSE]
 crc_mae <- MultiAssayExperiment(
   experiments = list(
     RNASeq = rna_se,
-    Embedding_layer0  = embedding_se_layer0,
-    Embedding_layer10 = embedding_se_layer10,
-    Embedding_layer11 = embedding_se_layer11,
-    Embedding_layer12 = embedding_se_layer12,
+    #mbedding_layer0  = embedding_se_layer0,
+    #Embedding_layer10 = embedding_se_layer10,
+    #Embedding_layer11 = embedding_se_layer11,
+    #Embedding_layer12 = embedding_se_layer12,
     Embedding_last    = embedding_se_last
   ),
   colData = metadata_mae
@@ -275,7 +282,6 @@ lapply(exps, function(x) head(rownames(x)))
 ```{r}
 # Create MOFA object
 mofa_object <- create_mofa_from_MultiAssayExperiment(crc_mae)
-class(crc_mae)
 # Define model options
 model_opts <- get_default_model_options(mofa_object)
 model_opts$num_factors <- 15
@@ -303,12 +309,12 @@ mofa_object <- prepare_mofa(
 
 mofa_object.trained <- run_mofa(
   mofa_object,
-  outfile = "mofa_model_rnaseq_5emb.hdf5",
+  outfile = "mofa_model_rnaseq_lastembed.hdf5",
   use_basilisk = TRUE
 )
 
 # Load trained MOFA model
-mofa_object.trained <- load_model("mofa_model_rnaseq_5emb.hdf5")
+mofa_object.trained <- load_model("mofa_model_rnaseq_lastembed.hdf5")
 
 #------------------------------------------
 # 1. Get MOFA sample names
@@ -334,7 +340,7 @@ metadata_matched$sample <- rownames(metadata_matched)
 samples_metadata(mofa_object.trained) <- metadata_matched
 
 # Save the updated object (RDS is easiest)
-saveRDS(mofa_object.trained, file = "mofa_model_with_metadata.rds")
+saveRDS(mofa_object.trained, file = "mofa_model_lastembed_with_metadata.rds")
 
 
 # visualize the model views and samples
@@ -347,6 +353,9 @@ plot_factor_cor(mofa_object.trained)
 # Plot variance explained
 plot_variance_explained(mofa_object.trained)
 
+plot_variance_explained(mofa_object.trained, plot_total = T)
+print(mofa_object.trained@cache$variance_explained)
+
 
 ```
 
@@ -354,6 +363,26 @@ plot_variance_explained(mofa_object.trained)
 
 ## misc
 
+```{r}
+# Extract embedding matrices
+mat_layer0  <- assay(embedding_se_layer0, "embedding")
+mat_layer10 <- assay(embedding_se_layer10, "embedding")
+mat_layer11 <- assay(embedding_se_layer11, "embedding")
+mat_layer12 <- assay(embedding_se_layer12, "embedding")
+mat_last    <- assay(embedding_se_last, "embedding")
+
+# Calculate correlation between same embedding dimensions across layers
+layer_corr <- data.frame(
+  dim = rownames(mat_layer0),
+  cor_0_10  = diag(cor(t(mat_layer0), t(mat_layer10))),
+  cor_10_11 = diag(cor(t(mat_layer10), t(mat_layer11))),
+  cor_11_12 = diag(cor(t(mat_layer11), t(mat_layer12))),
+  cor_12_last = diag(cor(t(mat_layer12), t(mat_last)))
+)
+
+head(layer_corr)
+summary(layer_corr)
+```
 
 
 #### Load in TCGA CRC assay experiment data
