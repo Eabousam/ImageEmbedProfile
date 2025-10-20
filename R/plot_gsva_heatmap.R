@@ -1,7 +1,7 @@
 # -------------------------
 # GSVA heatmap
 # -------------------------
-plot_gsva_heatmap <- function(gsva_collection = "hallmark", top_n_pathways = 20) {
+plot_gsva_heatmap <- function(gsva_collection = "hallmark", top_n_pathways = 30) {
   
   gsva_list <- switch(
     gsva_collection,

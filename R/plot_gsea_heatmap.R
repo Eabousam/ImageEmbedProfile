@@ -1,7 +1,7 @@
 # -------------------------
 # GSEA heatmap
 # -------------------------
-plot_gsea_heatmap <- function(gsea_collection = "hallmark", top_n_pathways = 20) {
+plot_gsea_heatmap <- function(gsea_collection = "hallmark", top_n_pathways = 30) {
   
   gsea_mat <- sapply(names(factor_interpretation), function(factor_id) {
     
