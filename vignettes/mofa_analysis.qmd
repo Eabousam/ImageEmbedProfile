@@ -40,6 +40,7 @@ library(Hmisc)
 library(pheatmap)
 library(DT)
 library(tidyverse)
+library(kableExtra)
 
 devtools::load_all()
 
@@ -295,6 +296,93 @@ head(embedding_weight_table)
 ```
 
 
+
+# Exploring Embeddings
+
+```{r}
+# PCA on embeddings
+pca_res <- prcomp(embedding_matched, scale. = TRUE)
+
+# Examine variance explained
+summary(pca_res)
+
+# Get sample scores (N x components)
+pca_scores <- as.data.frame(pca_res$x)
+head(pca_scores)
+
+# Correlate PCA components with MOFA factor scores
+pca_factor_cor <- cor(pca_scores, factor_scores_matched[, -1], use = "pairwise.complete.obs")
+
+
+# visualize first two PCs
+ggplot(pca_scores, aes(PC1, PC2)) +
+  geom_point(color = "gray40") +
+  theme_minimal() +
+  labs(title = "PCA of Image Embeddings",
+       x = paste0("PC1 (", round(summary(pca_res)$importance[2,1]*100, 1), "% var)"),
+       y = paste0("PC2 (", round(summary(pca_res)$importance[2,2]*100, 1), "% var)"))
+
+ggplot(pca_scores %>% cbind(df), aes(PC1, PC2, color = cluster)) + geom_point()
+
+
+```
+
+
+
+```{r}
+# Clinical variables to test
+clin_vars <- c("tumor_tissue_site", "gender", "histological_type",
+              "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
+              "pathologic_stage")
+
+# Initialize list to store R² results
+r2_results <- list()
+
+for (v in clin_vars) {
+  if (!v %in% names(df)) next
+  r2_vec <- sapply(names(pca_scores), function(pc) {
+    f <- as.formula(paste(pc, "~", v))
+    mod <- lm(f, data = cbind(df, pca_scores))
+    summary(mod)$r.squared
+  })
+  r2_results[[v]] <- data.frame(
+    PC = names(pca_scores),
+    R2 = r2_vec,
+    variable = v
+  )
+}
+
+r2_df <- do.call(rbind, r2_results)  %>%
+  dplyr::filter(as.numeric(gsub("PC", "", PC)) <= 60)
+
+
+# Plot
+r2_df$PC <- as.numeric(gsub("PC", "", r2_df$PC))
+
+ggplot(r2_df, aes(x = PC, y = R2, color = variable, group = variable)) +
+  geom_line() +
+  geom_point(size = 1.2) +
+  scale_x_continuous(
+    breaks = seq(0, 60, 10),
+    labels = seq(0, 60, 10),
+    expand = c(0, 0)
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 0, vjust = 0.5)
+  ) +
+  labs(
+    title = "Variance in PCA Components Explained by Clinical Variables",
+    x = "PC",
+    y = expression(R^2 ~ " (from linear model)")
+  )
+
+```
+
+
+
+
 # Projection of embeddings
 
 ```{r}
@@ -336,285 +424,277 @@ heatmap(embedding_weights, scale = "row",
 ```
 
 
-# Analyse clusters of embeddings
+# Analyse clusters of embeddings projection Factor 3
 
 ```{r}
-# Clean cluster analysis for Factor3 with both GSEA and GSVA
-analyze_factor3_clusters <- function() {
-  
-  # 1. Get projections and actual scores
-  proj <- Xs %*% W[, "Factor3"]
-  actual_scores <- Ys[, "Factor3"]
-  
-  # 2. Simple cluster assignment
-  clusters <- ifelse(proj > median(proj), "Cluster1", "Cluster2")
-  
-  # 3. Create results with metadata and pathways
-  results_df <- data.frame(
-    sample_id = rownames(Xs),
-    projection = proj,
-    factor_score = actual_scores,
-    cluster = clusters
-  )
-  
-  # 4. Add key metadata
-  metadata <- samples_metadata(mofa_object.trained)
-  key_metadata <- metadata[, c("patientID", "tumor_tissue_site", "pathologic_stage", 
-                              "pathology_T_stage", "pathology_N_stage", "pathology_M_stage",
-                              "gender", "histological_type")]
-  
-  results_df <- results_df %>%
-    left_join(key_metadata, by = c("sample_id" = "patientID"))
-  
-  # 5. Add BOTH GSEA and GSVA pathways for Factor3
-  # GSVA pathways (from your correlation analysis)
-  gsva_pathways <- get_top_gsva_pathways()
-  gsva_data <- as.data.frame(t(ssgsea_hallmark[gsva_pathways, ]))
-  gsva_data$sample_id <- rownames(gsva_data)
-  
-  results_df <- results_df %>%
-    left_join(gsva_data, by = "sample_id")
-  
-  return(results_df)
-}
 
-# Get top GSVA pathways for Factor3 (including estrogen)
-get_top_gsva_pathways <- function() {
-  factor3_gsva <- hallmark_interpret[["Factor3"]]
-  
-  # Get top 5 positive and 5 negative pathways from GSVA
-  top_positive <- head(factor3_gsva$positive_pathways, 5)
-  top_negative <- head(factor3_gsva$negative_pathways, 5)
-  
-  return(c(top_positive, top_negative))
-}
+library(dplyr)
+library(ggplot2)
+library(glue)
 
-# Print comprehensive Factor3 interpretation
-print_factor3_interpretation <- function() {
-  cat("=== COMPREHENSIVE FACTOR3 INTERPRETATION ===\n\n")
-  
-  cat("GSEA RESULTS (Gene-level enrichment):\n")
-  cat("-------------------------------------\n")
-  cat("• Epithelial-mesenchymal transition (p=5.2e-29)\n")
-  cat("• Myogenesis (p=2.7e-11)\n")
-  cat("• Oxidative phosphorylation (p=3.1e-09)\n")
-  cat("• MYC targets V1 (p=3.0e-05)\n")
-  cat("• Apical junction (p=9.4e-05)\n")
-  cat("• Angiogenesis (p=3.8e-04)\n\n")
-  
-  cat("GSVA RESULTS (Pathway activity correlation):\n")
-  cat("--------------------------------------------\n")
-  cat("POSITIVE correlations:\n")
-  cat("• Epithelial-mesenchymal transition (r=0.23)\n")
-  cat("• Myogenesis (r=0.21)\n")
-  cat("• Angiogenesis (r=0.18)\n")
-  cat("• Apical junction (r=0.17)\n")
-  cat("• Coagulation (r=0.16)\n\n")
-  
-  cat("NEGATIVE correlations:\n")
-  cat("• ESTROGEN_RESPONSE_LATE (r=-0.21) ***\n")
-  cat("• Heme metabolism (r=-0.12)\n")
-  cat("• Spermatogenesis (r=-0.06)\n")
-  cat("• Allograft rejection (r=-0.06)\n")
-  cat("• Unfolded protein response (r=-0.05)\n\n")
-}
+# --- 1. Cluster assignment and merge metadata
+proj <- Xs %*% W[, "Factor3"]
 
-# Enhanced cluster analysis
-run_factor3_cluster_analysis <- function() {
-  cat("=== FACTOR3 CLUSTER ANALYSIS ===\n\n")
-  
-  # Print pathway context first
-  print_factor3_interpretation()
-  
-  # 1. Get cluster data
-  cluster_data <- analyze_factor3_clusters()
-  
-  # 2. Analyze clinical differences
-  cat("CLINICAL DIFFERENCES BETWEEN CLUSTERS:\n")
-  cat("--------------------------------------\n")
-  analyze_clinical_differences(cluster_data)
-  
-  # 3. Analyze pathway differences
-  cat("\nPATHWAY DIFFERENCES BETWEEN CLUSTERS:\n")
-  cat("-------------------------------------\n")
-  pathway_diffs <- analyze_pathway_differences(cluster_data)
-  
-  # 4. Create visualizations
-  cat("\nGENERATING PLOTS...\n")
-  plots <- create_cluster_plots(cluster_data)
-  
-  return(list(
-    cluster_data = cluster_data,
-    pathway_differences = pathway_diffs,
-    plots = plots
-  ))
-}
+# kmeans ** note: could use other clustering methods
 
-# Clinical differences analysis
-analyze_clinical_differences <- function(cluster_data) {
-  
-  # Test tumor tissue site (colon vs rectal)
-  if("tumor_tissue_site" %in% colnames(cluster_data)) {
-    site_table <- table(cluster_data$cluster, cluster_data$tumor_tissue_site)
-    print(site_table)
+
+
+clusters <- ifelse(proj > median(proj), "Cluster1", "Cluster2")
+
+df <- data.frame(
+  sample_id = rownames(Xs),
+  projection = proj,
+  factor_score = Ys[, "Factor3"],
+  cluster = clusters
+)
+
+metadata <- samples_metadata(mofa_object.trained)
+df <- left_join(df, metadata, by = c("sample_id" = "patientID"))
+
+# --- 2. Add GSVA pathways (top 10 pos/neg)
+f3 <- hallmark_interpret[["Factor3"]]
+pathways <- c(head(f3$positive_pathways, 10), head(f3$negative_pathways, 10))
+gsva <- as.data.frame(t(ssgsea_hallmark[pathways, ]))
+gsva$sample_id <- rownames(gsva)
+df <- left_join(df, gsva, by = "sample_id")
+
+# --- 3. Summarize categorical metadata
+cat_vars <- c("tumor_tissue_site", "gender", "histological_type",
+              "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
+              "pathologic_stage")
+
+cat_summary <- lapply(cat_vars, function(v) {
+  if (!v %in% names(df)) return(NULL)
+  tab <- table(df$cluster, df[[v]], useNA = "ifany")
+  c1 <- paste0(colnames(tab), ": ", as.integer(tab["Cluster1",]), " (", round(100*tab["Cluster1",]/sum(tab["Cluster1",]),1), "%)", collapse="; ")
+  c2 <- paste0(colnames(tab), ": ", as.integer(tab["Cluster2",]), " (", round(100*tab["Cluster2",]/sum(tab["Cluster2",]),1), "%)", collapse="; ")
+  p <- NA
+  test <- NA
+  if (all(dim(tab)==c(2,2))) {
+    test <- "Fisher"
+    p <- tryCatch(fisher.test(tab)$p.value, error=function(e) NA)
+  } else if (nrow(tab)==2) {
+    test <- "Chi-square"
+    p <- tryCatch(chisq.test(tab)$p.value, error=function(e) NA)
+  }
+  data.frame(variable=v, cluster1=c1, cluster2=c2, test=test, p_value=p)
+}) %>% bind_rows()
+
+print(cat_summary)
+
+
+# Prepare data for plotting
+cat_plot_data <- df %>%
+  select(cluster, all_of(cat_vars)) %>%
+  pivot_longer(cols = -cluster, names_to = "variable", values_to = "value") %>%
+  group_by(cluster, variable, value) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(variable, cluster) %>%
+  mutate(freq = n / sum(n))
+
+# Create one figure per variable
+plots <- lapply(unique(cat_plot_data$variable), function(v) {
+  ggplot(subset(cat_plot_data, variable == v),
+         aes(x = cluster, y = freq, fill = value)) +
+    geom_bar(stat = "identity", position = "fill") +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(title = glue("Cluster composition by {v}"), y = "Proportion", x = "Cluster") +
+    theme_minimal() +
+    theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+})
+
+# Display the first plot as example
+plots[[1]]
+
+# --- 4. Compare numeric pathways
+pathway_vars <- names(df)[sapply(df, is.numeric)]
+pathway_vars <- setdiff(pathway_vars, c("projection", "factor_score"))
+
+num_summary <- lapply(pathway_vars, function(p) {
+  vals1 <- df[[p]][df$cluster=="Cluster1"]
+  vals2 <- df[[p]][df$cluster=="Cluster2"]
+  mean_diff <- mean(vals1, na.rm=TRUE) - mean(vals2, na.rm=TRUE)
+  pval <- NA
+  if (var(vals1, na.rm=TRUE) !=0 & var(vals2, na.rm=TRUE)!=0) {
+    pval <- tryCatch(t.test(vals1, vals2)$p.value, error=function(e) NA)
+  }
+  data.frame(pathway=p, mean_diff=mean_diff, p_value=pval)
+}) %>% bind_rows() %>% arrange(p_value)
+
+print(head(num_summary, 20))  # top 20 differences
+
+
+# --- 6. Plot clusters
+ggplot(df, aes(x=factor_score, y=projection, color=cluster)) +
+  geom_point(alpha=0.7) +
+  theme_minimal() +
+  labs(title="Factor3 clusters", x="MOFA Factor3", y="Projection")
+
+
+
+
+```
+
+
+# factor 3 Surv cluster
+```{R}
+
+# surv
+# Keep only complete cases
+surv_df <- df %>%
+  mutate(
+    time = ifelse(
+      vital_status.x == 1,
+      days_to_death.x,
+      pmax(patient.days_to_last_followup,
+           patient.days_to_last_known_alive,
+           na.rm = TRUE)
+    ),
+    event = ifelse(vital_status.x == 1, 1, 0)
     
-    fisher_p <- fisher.test(site_table)$p.value
-    cat("Tumor site Fisher p-value:", round(fisher_p, 4), "\n")
-  }
-}
+  ) %>%
+  filter(!is.na(time), !is.na(event), !is.na(cluster), time > 0) %>%
+  mutate(cluster = factor(cluster))
 
-# Pathway differences analysis - focused on key pathways
-analyze_pathway_differences <- function(cluster_data) {
-  
-  # Focus on key pathways from both GSEA and GSVA
-  key_pathways <- c(
-    "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
-    "HALLMARK_MYOGENESIS", 
-    "HALLMARK_ANGIOGENESIS",
-    "HALLMARK_ESTROGEN_RESPONSE_LATE",
-    "HALLMARK_OXIDATIVE_PHOSPHORYLATION"
-  )
-  
-  pathway_results <- data.frame()
-  
-  for(pathway in key_pathways) {
-    if(pathway %in% colnames(cluster_data)) {
-      cluster1_vals <- cluster_data[[pathway]][cluster_data$cluster == "Cluster1"]
-      cluster2_vals <- cluster_data[[pathway]][cluster_data$cluster == "Cluster2"]
-      
-      t_test <- t.test(cluster1_vals, cluster2_vals)
-      
-      pathway_results <- rbind(pathway_results, data.frame(
-        pathway = pathway,
-        cluster1_mean = mean(cluster1_vals, na.rm = TRUE),
-        cluster2_mean = mean(cluster2_vals, na.rm = TRUE),
-        mean_difference = mean(cluster1_vals, na.rm = TRUE) - mean(cluster2_vals, na.rm = TRUE),
-        p_value = t_test$p.value
-      ))
-    }
-  }
-  
-  # Sort by significance
-  pathway_results <- pathway_results[order(pathway_results$p_value), ]
-  
-  # Print results
-  print(pathway_results)
-  
-  return(pathway_results)
-}
+# Fit KM 
+km_fit <- survfit(Surv(time, event) ~ cluster, data = surv_df)
 
-# Create focused visualizations
-create_cluster_plots <- function(cluster_data) {
-  library(ggplot2)
-  library(patchwork)
-  
-  plots <- list()
-  
-  # Plot 1: Basic cluster scatter
-  plots$scatter_basic <- ggplot(cluster_data, aes(x = factor_score, y = projection, color = cluster)) +
-    geom_point(alpha = 0.7, size = 2) +
-    labs(title = "Factor3: Two Distinct Clusters",
-         x = "MOFA Factor3 Score", 
-         y = "Embedding Projection") +
-    theme_minimal()
-  
-  # Plot 2: Estrogen response by cluster (key finding)
-  if("HALLMARK_ESTROGEN_RESPONSE_LATE" %in% colnames(cluster_data)) {
-    plots$estrogen_boxplot <- ggplot(cluster_data, aes(x = cluster, y = HALLMARK_ESTROGEN_RESPONSE_LATE, fill = cluster)) +
-      geom_boxplot(alpha = 0.7) +
-      labs(title = "Key Finding: Estrogen Response by Cluster",
-           y = "Estrogen Response Activity") +
-      theme_minimal() +
-      theme(legend.position = "none")
-  }
-  
-  # Plot 3: EMT by cluster (GSEA top pathway)
-  if("HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION" %in% colnames(cluster_data)) {
-    plots$emt_boxplot <- ggplot(cluster_data, aes(x = cluster, y = HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION, fill = cluster)) +
-      geom_boxplot(alpha = 0.7) +
-      labs(title = "GSEA Top Pathway: EMT by Cluster",
-           y = "EMT Activity") +
-      theme_minimal() +
-      theme(legend.position = "none")
-  }
-  
-  # Plot 4: Tumor site distribution
-  if("tumor_tissue_site" %in% colnames(cluster_data)) {
-    plots$site_bar <- ggplot(cluster_data, aes(x = cluster, fill = tumor_tissue_site)) +
-      geom_bar(position = "fill") +
-      labs(title = "Tumor Site Distribution by Cluster",
-           y = "Proportion") +
-      theme_minimal()
-  }
-  
-  return(plots)
-}
+# Plot
+ggsurvplot(
+   km_fit,
+   data = surv_df,
+   risk.table = TRUE,
+   pval = TRUE,
+   conf.int = TRUE,
+   palette = c("#E7B800", "#2E9FDF"),
+   title = "Kaplan-Meier Survival by Factor3 Projection Cluster",
+   xlab = "Time (days)",
+   ylab = "Survival Probability"
+)
 
-# Run the analysis
-results <- run_factor3_cluster_analysis()
 
-# Display cluster summary
-cat("\nCLUSTER SUMMARY:\n")
-print(results$cluster_data %>% 
-        group_by(cluster) %>% 
-        summarise(
-          n_samples = n(),
-          avg_factor_score = mean(factor_score),
-          avg_projection = mean(projection)
-        ))
+# cox model
 
-# Show plots
-results$plots$scatter_basic
-if(!is.null(results$plots$estrogen_boxplot)) results$plots$estrogen_boxplot
-if(!is.null(results$plots$emt_boxplot)) results$plots$emt_boxplot  
-if(!is.null(results$plots$site_bar)) results$plots$site_bar
+
+
 ```
 
+
+
+# Factor scores and clin vars
 
 ```{r}
-# Create focused visualizations
-create_focused_plots <- function(cluster_data) {
-  library(ggplot2)
-  library(patchwork)
-  
-  # Plot 1: Estrogen Response by Cluster (most significant)
-  p1 <- ggplot(cluster_data, aes(x = cluster, y = HALLMARK_ESTROGEN_RESPONSE_LATE, fill = cluster)) +
-    geom_boxplot(alpha = 0.7) +
-    labs(title = "Strongest Signal: Estrogen Response",
-         y = "Estrogen Response Activity") +
-    theme_minimal() +
-    theme(legend.position = "none")
-  
-  # Plot 2: Angiogenesis by Cluster  
-  p2 <- ggplot(cluster_data, aes(x = cluster, y = HALLMARK_ANGIOGENESIS, fill = cluster)) +
-    geom_boxplot(alpha = 0.7) +
-    labs(title = "Angiogenesis Difference",
-         y = "Angiogenesis Activity") +
-    theme_minimal() +
-    theme(legend.position = "none")
-  
-  # Plot 3: Tumor stage distribution
-  p3 <- ggplot(cluster_data, aes(x = cluster, fill = pathologic_stage)) +
-    geom_bar(position = "fill") +
-    labs(title = "Stage Distribution by Cluster",
-         y = "Proportion") +
-    theme_minimal()
-  
-  # Plot 4: Tumor site by cluster
-  p4 <- ggplot(cluster_data, aes(x = cluster, fill = tumor_tissue_site)) +
-    geom_bar(position = "fill") +
-    labs(title = "Tumor Site by Cluster", 
-         y = "Proportion") +
-    theme_minimal()
-  
-  return((p1 + p2) / (p3 + p4))
+# Ensure metadata merged correctly
+factors_metadata_df <- get_factors(mofa_object.trained, factors = "all", as.data.frame = TRUE) %>%
+  inner_join(metadata_df, by = c("sample" = "patientID"))
+
+factors_metadata_df <- factors_metadata_df %>%
+  select(sample, factor, value, all_of(clin_vars)) %>%
+  pivot_wider(names_from = factor, values_from = value)
+
+# selecting some clinical metadata vars
+clin_vars <- c("tumor_tissue_site", "gender", "histological_type",
+               "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
+               "pathologic_stage")
+
+# empty df for results
+r2_df_mofa_factors <- data.frame()
+
+for (var in clin_vars) {
+  for (f in grep("^Factor", names(factors_metadata_df), value = TRUE)) {
+    y <- as.numeric(factors_metadata_df[[f]])
+    x <- factors_metadata_df[[var]]
+
+    if (all(is.na(y)) || length(unique(na.omit(x))) < 2) next
+
+    model <- lm(y ~ x)
+    r2 <- summary(model)$r.squared
+
+    r2_df_mofa_factors <- rbind(
+      r2_df_mofa_factors,
+      data.frame(Factor = f, Clinical_Variable = var, R2 = r2)
+    )
+  }
 }
 
-# Generate focused plots
-focused_plots <- create_focused_plots(results$cluster_data)
-print(focused_plots)
+# Plot
+
+ggplot(r2_df_mofa_factors, aes(
+  x = as.numeric(gsub("Factor", "", Factor)),
+  y = R2,
+  color = Clinical_Variable,
+  group = Clinical_Variable
+)) +
+  geom_line() +
+  geom_point(size = 1.2) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, max(as.numeric(gsub("Factor", "", r2_df_mofa_weights$Factor))), 2)) +
+  labs(
+    title = "Variance in MOFA Factors Explained by Clinical Variables",
+    x = "MOFA Factor",
+    y = expression(R^2 ~ " (from linear model)")
+  )
+
 ```
 
+
+
+# Factor scores and clin vars
+
+```{r}
+# Ensure metadata merged correctly
+weights_metadata_df <- get_factors(mofa_object.trained, factors = "all", as.data.frame = TRUE) %>%
+  inner_join(metadata_df, by = c("sample" = "patientID"))
+
+weights_metadata_wide <- weights_metadata_df %>%
+  select(sample, factor, value, all_of(clin_vars)) %>%
+  pivot_wider(names_from = factor, values_from = value)
+
+# selecting some clinical metadata vars
+clin_vars <- c("tumor_tissue_site", "gender", "histological_type",
+               "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
+               "pathologic_stage")
+
+table(weights_metadata_wide$patient.anatomic_neoplasm_subdivision)
+# empty df for results
+r2_df_mofa_weights <- data.frame()
+
+for (var in clin_vars) {
+  for (f in grep("^Factor", names(weights_metadata_wide), value = TRUE)) {
+    y <- as.numeric(weights_metadata_wide[[f]])
+    x <- weights_metadata_wide[[var]]
+
+    if (all(is.na(y)) || length(unique(na.omit(x))) < 2) next
+
+    model <- lm(y ~ x)
+    r2 <- summary(model)$r.squared
+
+    r2_df_mofa_weights <- rbind(
+      r2_df_mofa_weights,
+      data.frame(Factor = f, Clinical_Variable = var, R2 = r2)
+    )
+  }
+}
+
+# Plot
+
+ggplot(r2_df_mofa_weights, aes(
+  x = as.numeric(gsub("Factor", "", Factor)),
+  y = R2,
+  color = Clinical_Variable,
+  group = Clinical_Variable
+)) +
+  geom_line() +
+  geom_point(size = 1.2) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, max(as.numeric(gsub("Factor", "", r2_df_mofa_weights$Factor))), 2)) +
+  labs(
+    title = "Variance in MOFA Factors Explained by Clinical Variables",
+    x = "MOFA Factor",
+    y = expression(R^2 ~ " (from linear model)")
+  )
+
+```
 
 
 
@@ -1054,216 +1134,138 @@ all_factors_table <- create_summary_table(
 # Interpretation Report
 
 ```{r}
-# Interpretation Report
-
 rmd_html <- "MOFA_factor_summary.Rmd"
 
 writeLines(c(
-  "---",
-  "title: '<center>MOFA Factor Analysis: Biological Pathway Associations</center>'",
-  "output:",
-  "  html_document:",
-  "    toc: true",
-  "    toc_float: true",
-  "    toc_depth: 3",
-  "    number_sections: true",
-  "    theme: journal",
-  "    css: styles.css",
-  "    df_print: paged",
-  "---",
-  "",
-  "```{r setup, include=FALSE}",
-  "knitr::opts_chunk$set(",
-  "  echo = FALSE, warning = FALSE, message = FALSE,",
-  "  fig.align = 'center',",
-  "  fig.width = 7, fig.height = 5,",
-  "  out.width = '100%',",
-  "  fig.show = 'asis'",
-  ")",
-  "library(kableExtra)",
-  "library(dplyr)",
-  "library(DT)",
-  "library(patchwork)",
-  "library(ggplot2)",
-  "```",
-  "",
-  "<style>",
-  "@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Merriweather:wght@400;700&display=swap');",
-  "",
-  "body {",
-  "  font-family: 'Roboto', sans-serif;",
-  "  line-height: 1.7;",
-  "  color: #2c3e50;",
-  "  background-color: #fafafa;",
-  "  max-width: 1100px;",
-  "  margin: auto;",
-  "  padding: 20px;",
-  "}",
-  "h1, h2, h3 {",
-  "  font-family: 'Merriweather', serif;",
-  "  color: #1a5276;",
-  "  margin-top: 2em;",
-  "  padding-bottom: 0.3em;",
-  "  border-bottom: 2px solid #5dade2;",
-  "}",
-  "table {",
-  "  border-collapse: collapse;",
-  "  margin: 1em 0;",
-  "}",
-  "th {",
-  "  background-color: #5dade2;",
-  "  color: #fff;",
-  "  padding: 8px;",
-  "  text-align: left;",
-  "}",
-  "td {",
-  "  padding: 8px;",
-  "  border-bottom: 1px solid #ddd;",
-  "}",
-  ".table-caption {",
-  "  font-weight: 600;",
-  "  font-size: 1.1em;",
-  "  color: #34495e;",
-  "  margin-bottom: 8px;",
-  "}",
-  "code, pre {",
-  "  font-family: 'Fira Code', monospace;",
-  "  background-color: #f4f6f6;",
-  "  padding: 2px 6px;",
-  "  border-radius: 4px;",
-  "}",
-  "</style>",
-  "",
+"---",
+"title: '<center>MOFA Factor Analysis: Biological Pathway Associations</center>'",
+"output:",
+"  html_document:",
+"    toc: true",
+"    toc_float: true",
+"    toc_depth: 3",
+"    number_sections: true",
+"    theme: flatly",
+"    css: styles.css",
+"    df_print: paged",
+"---",
+"",
+"```{r setup, include=FALSE}",
+"knitr::opts_chunk$set(",
+"  echo = FALSE, warning = FALSE, message = FALSE,",
+"  fig.align = 'center', fig.width = 7, fig.height = 5,",
+"  out.width = '100%', fig.show = 'asis'",
+")",
+"library(kableExtra); library(dplyr); library(DT); library(patchwork); library(ggplot2)",
+"```",
+"",
+"<style>",
+"@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Merriweather:wght@400;700&display=swap');",
+"body {font-family: 'Roboto', sans-serif; line-height: 1.7; color: #2c3e50; background-color: #fafafa; max-width: 1100px; margin: auto; padding: 20px;}",
+"h1, h2, h3 {font-family: 'Merriweather', serif; color: #1a5276; margin-top: 2em; padding-bottom: 0.3em; border-bottom: 2px solid #5dade2;}",
+"table {border-collapse: collapse; margin: 1em 0;}",
+"th {background-color: #1a5276; color: #f8f9fa; font-weight: 600; padding: 8px; text-align: left;}",
+"td {padding: 8px; border-bottom: 1px solid #ddd;}",
+".table-caption {font-weight: 600; font-size: 1.1em; color: #34495e; margin-bottom: 8px;}",
+"code, pre {font-family: 'Fira Code', monospace; background-color: #f4f6f6; padding: 2px 6px; border-radius: 4px;}",
+"</style>",
+"",
 "# Introduction",
+"Using processed WSIs from ProviGigaPath, we extracted image embeddings representing tissue features. These embeddings were aligned with TCGA multi-omics data, including RNA-seq, enabling cross-modal analysis.",
 "",
-"Using processed whole slide images (WSIs) from ProviGigaPath, we extracted image embeddings to numerically represent visual tissue features. These embeddings were matched to curated TCGA multi-omics data, including RNA-seq, allowing integration of histology and molecular profiles.",
+"MOFA (Multi-Omics Factor Analysis) was used to identify latent factors capturing shared variation across modalities. Embedding weights were correlated with factor loadings to identify visual-molecular associations.",
 "",
-"MOFA (Multi-Omics Factor Analysis) was applied to jointly analyze the embeddings and molecular data, identifying latent factors that capture shared variation across modalities. We then correlated embedding weights with factor loadings to determine which visual features aligned with specific latent factors.",
+"Biological interpretation was achieved via FGSEA and GSVA applied to RNA-seq factor loadings, revealing enriched pathways per factor. This pipeline links histology patterns to molecular mechanisms in an interpretable manner.",
 "",
-"Biological interpretation was achieved by applying FGSEA (Fast Gene Set Enrichment Analysis) and GSVA (Gene Set Variation Analysis) to the RNA-seq factor loadings, uncovering pathways associated with each factor. This pipeline systematically links histology image patterns to molecular mechanisms in an interpretable way.",
-"",
-"# Data Sources and Analytical Pipeline",
-"- **MOFA Model**: Trained on multi-omics views: Prov-GigaPath WSI Embedding and RNAseq data",
-"- **Pathway Databases**: MSigDB Hallmark, C2 (Curated), C6 (Oncogenic)",
-"- **Analysis Methods**: GSEA (preranked), GSVA (sample-level)",
-"- **Pipeline**:",
-"  1. Extract factor weights from MOFA model",
-"  2. Perform preranked GSEA on factor loadings",
-"  3. Calculate pathway activity scores using GSVA",
+"# Data Sources and Pipeline",
+"- **MOFA Model:** Prov-GigaPath WSI embeddings + RNAseq",
+"- **Pathway Databases:** MSigDB Hallmark, C2, C6",
+"- **Methods:** FGSEA (preranked), GSVA (sample-level)",
+"- **Pipeline:**",
+"  1. Extract factor weights",
+"  2. Perform FGSEA on loadings",
+"  3. Compute GSVA pathway activities",
 "  4. Correlate factors with pathway activities",
 "",
-  "# Latent Factor Visualization",
-  "",
-  "## MOFA output",
-  "```{r factor-plots, fig.width=12, fig.height=8}",
-  "print(plot_variance_explained(mofa_object.trained, plot_total = TRUE))",
-  "## Heatmaps",
-  "```{r heatmap-plots, fig.width=12, fig.height=10}",
-  "if (exists('plot_gsea_heatmap')) {",
-  "  print(plot_gsea_heatmap('hallmark', top_n_pathways = 30))",
-  "  print(plot_gsva_heatmap('hallmark', top_n_pathways = 20))",
-  "  print(plot_gsea_heatmap('c2', top_n_pathways = 30))",
-  "  print(plot_gsva_heatmap('c2', top_n_pathways = 20))",
-  "  print(plot_gsea_heatmap('c6', top_n_pathways = 20))",
-  "  print(plot_gsva_heatmap('c6', top_n_pathways = 20))",
-  "}",
-  "```",
-  "",
-  "## Summary of Factor Interpretations",
-  "```{r summary-table, results='asis'}",
-  "if (exists('all_factors_table')) {",
-  "  kable(all_factors_table, format = 'html', escape = FALSE,",
-  "        caption = '<strong>Table 1: MOFA Factor Biological Interpretations</strong>') %>%",
-  "    kable_styling(",
-  "      bootstrap_options = c('striped', 'hover', 'condensed'),",
-  "      full_width = TRUE,",
-  "      font_size = 12,",
-  "      position = 'center'",
-  "    ) %>%",
-  "    column_spec(1, bold = TRUE, width = '80px') %>%",
-  "    column_spec(2, width = '100px') %>%",
-  "    column_spec(3, width = '200px') %>%",
-  "    column_spec(4:ncol(all_factors_table), width = '250px') %>%",
-  "    scroll_box(width = '100%', height = '500px')",
-  "}",
-  "```",
-  "",
-  "## Embedding–Factor Correlation Table",
-  "",
-  "```{r embedding-factor-correlation, results='asis'}",
-  "if (exists('embedding_corr_table')) {",
-  "  top_corr_table <- embedding_corr_table %>%",
-  "    group_by(Factor) %>%",
-  "    slice_max(order_by = Abs_Corr, n = 20) %>%",
-  "    ungroup()",
-  "",
-  "  kable(top_corr_table, format = 'html', escape = FALSE,",
-  "        caption = '<strong>Table 3: Top Correlated Embeddings per Factor</strong>') %>%",
-  "    kable_styling(",
-  "      bootstrap_options = c('striped', 'hover', 'condensed'),",
-  "      full_width = TRUE,",
-  "      font_size = 12,",
-  "      position = 'center'",
-  "    ) %>%",
-  "    scroll_box(width = '100%', height = '500px')",
-  "}",
-  "```",
-  "",
-  "## MOFA Embedding Weight Table",
-  "",
-  "```{r embedding-weight-table, results='asis'}",
-  "if (exists('embedding_weight_table')) {",
-  "  kable(embedding_weight_table, format = 'html', escape = FALSE,",
-  "        caption = '<strong>Table 4: Top Weighted Embeddings per Factor (from MOFA Model)</strong>') %>%",
-  "    kable_styling(",
-  "      bootstrap_options = c('striped', 'hover', 'condensed'),",
-  "      full_width = TRUE,",
-  "      font_size = 12,",
-  "      position = 'center'",
-  "    ) %>%",
-  "    scroll_box(width = '100%', height = '500px')",
-  "}",
-  "```",
-  "",
-   "## Embedding–Factor Projection Plots for Factors 1, 3, 5",
-  "```{r embedding-projections, fig.width=7, fig.height=5}",
-  "selected_factors <- c('Factor1', 'Factor3', 'Factor5')",
-  "Xs <- scale(as.matrix(embedding_matched))",
-  "Ys <- scale(as.matrix(factor_scores_matched[, -1]))",
-  "W  <- as.matrix(embedding_weights)",
-  "for (j in selected_factors) {",
-  "  w_j <- W[, j]",
-  "  proj_wj <- Xs %*% w_j",
-  "  cor_val <- cor(proj_wj, Ys[, j])",
-  "  plot(Ys[, j], proj_wj,",
-  "       xlab = paste('MOFA factor', j, 'score'),",
-  "       ylab = 'Projection on embedding weights',",
-  "       main = paste('Embedding–Factor association:', j, '\\nCorrelation =', round(cor_val, 3)),",
-  "       pch = 16, col = 'gray40')",
-  "  abline(lm(proj_wj ~ Ys[, j]), col = 'red', lwd = 2)",
-  "}",
-  "```",
-  "",
-  "```{r embedding-weights-heatmap, fig.width=8, fig.height=6}",
-  "heatmap(W[, selected_factors], scale = 'row',",
-  "        xlab = 'Selected MOFA factors',",
-  "        ylab = 'Embedding dimensions',",
-  "        main = 'Embedding–Factor weight structure (Factors 1, 3, 5)')",
-  "```",
-  "## Factor Enrichment Plots",
-  "```{r factor-enrichment, fig.width=12, fig.height=12}",
-  "top_n_enrichment <- 3",
-  "if (exists('top_factors')) {",
-  "  for(f in top_factors) {",
-  "    enrichment_plot <- plot_factor_enrichment(f, pathway_collection='hallmark', top_n=top_n_enrichment, all_weights=all_weights)",
-  "    if(!is.null(enrichment_plot)) print(enrichment_plot[[1]])",
-  "  }",
-  "}",
-  "```"
+"# Latent Factor Visualization",
+"```{r factor-plots, fig.width=12, fig.height=8}",
+"print(plot_variance_explained(mofa_object.trained, plot_total = TRUE))",
+"```",
+"",
+"# PCA on Embeddings",
+"```{r pca-analysis, fig.width=10, fig.height=8}",
+"pca_res <- prcomp(embedding_matched, scale. = TRUE)",
+"pca_scores <- as.data.frame(pca_res$x)",
+"",
+"# Correlate PCA components with MOFA factors",
+"pca_factor_cor <- cor(pca_scores, factor_scores_matched[, -1], use = 'pairwise.complete.obs')",
+"",
+"# PCA scatter plot",
+"ggplot(pca_scores, aes(PC1, PC2)) +",
+"  geom_point(color = 'gray40', size = 2) +",
+"  theme_minimal(base_size = 14) +",
+"  labs(",
+"    title = 'PCA of Image Embeddings',",
+"    x = paste0('PC1 (', round(summary(pca_res)$importance[2,1]*100,1), '% var)'),",
+"    y = paste0('PC2 (', round(summary(pca_res)$importance[2,2]*100,1), '% var)')",
+"  )",
+"```",
+"",
+"# Embedding–Factor Tables",
+"## Table 1: Factor × Embedding Dimension Correlations",
+"```{r embedding-factor-correlation, results='asis'}",
+"if (exists('embedding_corr_table')) {",
+"  top_corr_table <- embedding_corr_table %>%",
+"    group_by(Factor) %>%",
+"    slice_max(order_by = Abs_Corr, n = 20) %>%",
+"    ungroup()",
+"",
+"  kable(top_corr_table, format = 'html', escape = FALSE,",
+"        caption = '<strong>Table 1: Top Correlated Embeddings per Factor</strong>') %>%",
+"    kable_styling(bootstrap_options = c('striped', 'hover', 'condensed'), full_width = TRUE, font_size = 12) %>%",
+"    scroll_box(width = '100%', height = '500px')",
+"}",
+"```",
+"",
+"## Table 2: Top Weighted Embeddings from MOFA",
+"```{r embedding-weight-table, results='asis'}",
+"if (exists('embedding_weight_table')) {",
+"  kable(embedding_weight_table, format = 'html', escape = FALSE,",
+"        caption = '<strong>Table 2: Top Weighted Embeddings per Factor (from MOFA Model)</strong>') %>%",
+"    kable_styling(bootstrap_options = c('striped', 'hover','condensed'), full_width = TRUE, font_size = 12) %>%",
+"    scroll_box(width = '100%', height = '500px')",
+"}",
+"```",
+"",
+"# GSEA / GSVA Factor Interpretation Table",
+"```{r factor-interpretation-table, results='asis'}",
+"if (exists('all_factors_table')) {",
+"  kable(all_factors_table, format = 'html', escape = FALSE,",
+"        caption = '<strong>Table 3: Factor-wise GSEA/GSVA and Top Gene Interpretations</strong>') %>%",
+"    kable_styling(bootstrap_options = c('striped','hover','condensed'), full_width = TRUE, font_size = 12) %>%",
+"    scroll_box(width = '100%', height = '700px')",
+"}",
+"```",
+"",
+"## Embedding–Factor Projection Plots (Factors 1, 3, 5)",
+"```{r embedding-projections, fig.width=7, fig.height=5}",
+"selected_factors <- c('Factor1','Factor3','Factor5')",
+"Xs <- scale(as.matrix(embedding_matched))",
+"Ys <- scale(as.matrix(factor_scores_matched[, -1]))",
+"W <- as.matrix(embedding_weights)",
+"for (j in selected_factors) {",
+"  w_j <- W[, j]",
+"  proj_wj <- Xs %*% w_j",
+"  cor_val <- cor(proj_wj, Ys[, j])",
+"  plot(Ys[, j], proj_wj, pch = 16, col = 'gray40',",
+"       xlab = paste('MOFA factor', j), ylab = 'Projection on embedding weights',",
+"       main = paste(j, '- correlation =', round(cor_val, 3)))",
+"  abline(lm(proj_wj ~ Ys[, j]), col = 'red', lwd = 2)",
+"}",
+"```"
 ), con = rmd_html)
-library("kableExtra")
-# Render HTML
-rmarkdown::render(rmd_html ,output_file = "MOFA_factor_summary_T2.html")
+rmarkdown::render(rmd_html, output_file = "MOFA_factor_summary_T2.html")
+
 ```
 
 ```{r}
