@@ -437,19 +437,20 @@ proj <- Xs %*% W[, "Factor3"]
 
 # kmeans ** note: could use other clustering methods
 
+# run k-means on the projection or embeddings
+km <- kmeans(proj, centers = 2, nstart = 20)
 
-
-clusters <- ifelse(proj > median(proj), "Cluster1", "Cluster2")
-
-df <- data.frame(
+# build dataframe
+factor3_cluster_df <- data.frame(
   sample_id = rownames(Xs),
-  projection = proj,
+  projection = as.numeric(proj),
   factor_score = Ys[, "Factor3"],
-  cluster = clusters
+  cluster = factor(km$cluster)
 )
 
+# merge metadata
 metadata <- samples_metadata(mofa_object.trained)
-df <- left_join(df, metadata, by = c("sample_id" = "patientID"))
+factor3_cluster_df <- left_join(factor3_cluster_df, metadata, by = c("sample_id" = "patientID"))
 
 # --- 2. Add GSVA pathways (top 10 pos/neg)
 f3 <- hallmark_interpret[["Factor3"]]
@@ -466,8 +467,15 @@ cat_vars <- c("tumor_tissue_site", "gender", "histological_type",
 cat_summary <- lapply(cat_vars, function(v) {
   if (!v %in% names(df)) return(NULL)
   tab <- table(df$cluster, df[[v]], useNA = "ifany")
-  c1 <- paste0(colnames(tab), ": ", as.integer(tab["Cluster1",]), " (", round(100*tab["Cluster1",]/sum(tab["Cluster1",]),1), "%)", collapse="; ")
-  c2 <- paste0(colnames(tab), ": ", as.integer(tab["Cluster2",]), " (", round(100*tab["Cluster2",]/sum(tab["Cluster2",]),1), "%)", collapse="; ")
+
+  # get the actual cluster names dynamically
+  clust_names <- rownames(tab)
+
+  c1 <- paste0(colnames(tab), ": ", as.integer(tab[clust_names[1],]), 
+               " (", round(100*tab[clust_names[1],]/sum(tab[clust_names[1],]),1), "%)", collapse="; ")
+  c2 <- paste0(colnames(tab), ": ", as.integer(tab[clust_names[2],]), 
+               " (", round(100*tab[clust_names[2],]/sum(tab[clust_names[2],]),1), "%)", collapse="; ")
+
   p <- NA
   test <- NA
   if (all(dim(tab)==c(2,2))) {
@@ -477,6 +485,7 @@ cat_summary <- lapply(cat_vars, function(v) {
     test <- "Chi-square"
     p <- tryCatch(chisq.test(tab)$p.value, error=function(e) NA)
   }
+
   data.frame(variable=v, cluster1=c1, cluster2=c2, test=test, p_value=p)
 }) %>% bind_rows()
 
@@ -484,7 +493,7 @@ print(cat_summary)
 
 
 # Prepare data for plotting
-cat_plot_data <- df %>%
+cat_plot_data <- factor3_cluster_df %>%
   select(cluster, all_of(cat_vars)) %>%
   pivot_longer(cols = -cluster, names_to = "variable", values_to = "value") %>%
   group_by(cluster, variable, value) %>%
@@ -507,7 +516,7 @@ plots <- lapply(unique(cat_plot_data$variable), function(v) {
 plots[[1]]
 
 # --- 4. Compare numeric pathways
-pathway_vars <- names(df)[sapply(df, is.numeric)]
+pathway_vars <- names(factor3_cluster_df)[sapply(df, is.numeric)]
 pathway_vars <- setdiff(pathway_vars, c("projection", "factor_score"))
 
 num_summary <- lapply(pathway_vars, function(p) {
@@ -525,7 +534,7 @@ print(head(num_summary, 20))  # top 20 differences
 
 
 # --- 6. Plot clusters
-ggplot(df, aes(x=factor_score, y=projection, color=cluster)) +
+ggplot(factor3_cluster_df, aes(x=factor_score, y=projection, color=cluster)) +
   geom_point(alpha=0.7) +
   theme_minimal() +
   labs(title="Factor3 clusters", x="MOFA Factor3", y="Projection")
@@ -538,23 +547,55 @@ ggplot(df, aes(x=factor_score, y=projection, color=cluster)) +
 
 # factor 3 Surv cluster
 ```{R}
-
 # surv
+
+# examine missingness by cluster, is there differential loss to follow up?
+factor3_cluster_df %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    n_dead = sum(patient.vital_status == "dead", na.rm = TRUE),
+    n_alive = sum(patient.vital_status == "alive", na.rm = TRUE),
+    missing_death = sum(is.na(days_to_death.x)),
+    missing_last_followup = sum(is.na(patient.days_to_last_followup)),
+    missing_last_alive = sum(is.na(patient.days_to_last_known_alive)),
+    zero_followup = sum(patient.days_to_last_followup <= 0, na.rm = TRUE),
+    zero_known_alive = sum(patient.days_to_last_known_alive <= 0, na.rm = TRUE)
+  )
+
+
+
 # Keep only complete cases
-surv_df <- df %>%
+surv_df <- factor3_cluster_df %>%
   mutate(
-    time = ifelse(
-      vital_status.x == 1,
-      days_to_death.x,
-      pmax(patient.days_to_last_followup,
-           patient.days_to_last_known_alive,
-           na.rm = TRUE)
+    # Define event from patient.vital_status
+    event = ifelse(patient.vital_status == "dead", 1, 0),
+
+    # Compute time:
+    # If dead, use days_to_death.x
+    # If alive, use the last follow-up available (patient.days_to_last_followup or patient.days_to_last_known_alive)
+    time = case_when(
+      event == 1 & !is.na(days_to_death.x) ~ days_to_death.x,
+      event == 0 & !is.na(patient.days_to_last_followup) & patient.days_to_last_followup > 0 ~ patient.days_to_last_followup,
+      event == 0 & !is.na(patient.days_to_last_known_alive) & patient.days_to_last_known_alive > 0 ~ patient.days_to_last_known_alive,
+      TRUE ~ NA_real_  # if none available
     ),
-    event = ifelse(vital_status.x == 1, 1, 0)
-    
+
+    # Clean up other variables
+    cluster = factor(cluster),
+    age     = patient.age_at_initial_pathologic_diagnosis,
+    gender  = factor(patient.gender),
+    stage   = factor(patient.stage_event.pathologic_stage),
+    site    = factor(tumor_tissue_site),
+    hist_type = factor(patient.histological_type)
   ) %>%
-  filter(!is.na(time), !is.na(event), !is.na(cluster), time > 0) %>%
-  mutate(cluster = factor(cluster))
+  filter(!is.na(time), !is.na(event), !is.na(cluster))
+
+
+
+# Range of time variable (should be in days, positive)
+range(surv_df$time, na.rm = TRUE)
+
 
 # Fit KM 
 km_fit <- survfit(Surv(time, event) ~ cluster, data = surv_df)
@@ -574,9 +615,29 @@ ggsurvplot(
 
 
 # cox model
+table(surv_df$event)
+
+cox_uni <- coxph(Surv(time, event) ~ cluster, data = surv_df)
+summary(cox_uni)
+
+# multivariable
+cox_fit_multi <- coxph(Surv(time, event) ~ cluster  + age + gender + pathologic_stage + hist_type, data = surv_df)
 
 
+# test PH assumption
+ph_test <- cox.zph(cox_fit_multi)
+ph_test
+plot(ph_test)        # diagnostic plots for each covariate
 
+# cox table
+table(surv_df$hist_type, surv_df$event)
+table(surv_df$hist_type, surv_df$cluster)
+cox_tbl <- tidy(cox_fit_multi, exponentiate = TRUE, conf.int = TRUE)
+cox_tbl <- cox_tbl %>%
+  select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(HR = estimate, CI_low = conf.low, CI_high = conf.high, pval = p.value)
+
+cox_tbl
 ```
 
 
@@ -639,62 +700,6 @@ ggplot(r2_df_mofa_factors, aes(
 
 
 
-# Factor scores and clin vars
-
-```{r}
-# Ensure metadata merged correctly
-weights_metadata_df <- get_factors(mofa_object.trained, factors = "all", as.data.frame = TRUE) %>%
-  inner_join(metadata_df, by = c("sample" = "patientID"))
-
-weights_metadata_wide <- weights_metadata_df %>%
-  select(sample, factor, value, all_of(clin_vars)) %>%
-  pivot_wider(names_from = factor, values_from = value)
-
-# selecting some clinical metadata vars
-clin_vars <- c("tumor_tissue_site", "gender", "histological_type",
-               "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
-               "pathologic_stage")
-
-table(weights_metadata_wide$patient.anatomic_neoplasm_subdivision)
-# empty df for results
-r2_df_mofa_weights <- data.frame()
-
-for (var in clin_vars) {
-  for (f in grep("^Factor", names(weights_metadata_wide), value = TRUE)) {
-    y <- as.numeric(weights_metadata_wide[[f]])
-    x <- weights_metadata_wide[[var]]
-
-    if (all(is.na(y)) || length(unique(na.omit(x))) < 2) next
-
-    model <- lm(y ~ x)
-    r2 <- summary(model)$r.squared
-
-    r2_df_mofa_weights <- rbind(
-      r2_df_mofa_weights,
-      data.frame(Factor = f, Clinical_Variable = var, R2 = r2)
-    )
-  }
-}
-
-# Plot
-
-ggplot(r2_df_mofa_weights, aes(
-  x = as.numeric(gsub("Factor", "", Factor)),
-  y = R2,
-  color = Clinical_Variable,
-  group = Clinical_Variable
-)) +
-  geom_line() +
-  geom_point(size = 1.2) +
-  theme_bw() +
-  scale_x_continuous(breaks = seq(0, max(as.numeric(gsub("Factor", "", r2_df_mofa_weights$Factor))), 2)) +
-  labs(
-    title = "Variance in MOFA Factors Explained by Clinical Variables",
-    x = "MOFA Factor",
-    y = expression(R^2 ~ " (from linear model)")
-  )
-
-```
 
 
 
