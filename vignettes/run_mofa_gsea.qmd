@@ -4,7 +4,6 @@ format: docx
 editor: visual
 ---
 
-
 ```{r}
 # Load required libraries
 library(fgsea)
@@ -14,15 +13,12 @@ library(msigdbr)
 devtools::load_all()
 ```
 
-
-
-
 # Read in MOFA Factor
+
 ```{r}
 mofa_object.trained <- readRDS("mofa_model_lastembed_with_metadata.rds")
 
 ```
-
 
 # Get gene sets
 
@@ -30,7 +26,6 @@ mofa_object.trained <- readRDS("mofa_model_lastembed_with_metadata.rds")
 gene_sets <- get_gene_sets()
 gene_sets$hallmark
 ```
-
 
 # run fGSEA
 
@@ -41,6 +36,14 @@ fgsea_results_hallmark <- run_fgsea_all_factors(
   pathways = gene_sets$hallmark, # Hallmark geneset
   view = "RNASeq"
 )
+
+```
+
+# run gsva
+
+```{r}
+
+gsva_results_hallmark <- run_gsva_mofa(mofa_object.trained, gene_sets$hallmark, view = "RNASeq")
 
 ```
 
