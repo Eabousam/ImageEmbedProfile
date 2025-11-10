@@ -1,0 +1,46 @@
+---
+title: "GeneSetAnalysis"
+format: docx
+editor: visual
+---
+
+
+```{r}
+# Load required libraries
+library(fgsea)
+library(msigdbr)  
+
+
+devtools::load_all()
+```
+
+
+
+
+# Read in MOFA Factor
+```{r}
+mofa_object.trained <- readRDS("mofa_model_lastembed_with_metadata.rds")
+
+```
+
+
+# Get gene sets
+
+```{r}
+gene_sets <- get_gene_sets()
+gene_sets$hallmark
+```
+
+
+# run fGSEA
+
+```{r}
+
+fgsea_results_hallmark <- run_fgsea_all_factors(
+  mofa_object.trained,
+  pathways = gene_sets$hallmark, # Hallmark geneset
+  view = "RNASeq"
+)
+
+```
+
