@@ -11,16 +11,6 @@ format:
 
 ## Image Analysis: TCGAData
 
-#### Setting up environment
-
-```{r}
-#| output: False
-renv::init()
-renv::snapshot()
-renv::status()
-
-```
-
 #### Setting up libraries
 
 ```{r}
@@ -77,8 +67,7 @@ read_mae <- curatedTCGAData(
 
 ```{r linktcga}
 coad_mae_emb <-
-    linkTCGA(coad_mae, catalog_coad, redownload = FALSE, parallel = FALSE)
-?linkTCGA
+    imageFeatureTCGA::linkTCGA(coad_mae, catalog_coad, redownload = FALSE, parallel = FALSE)
 
 read_mae_emb <-
     linkTCGA(coad_mae, catalog_read, redownload = FALSE, parallel = FALSE)
