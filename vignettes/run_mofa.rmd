@@ -37,10 +37,6 @@ catalog_coad <- getCatalog("provgigapath") |>
     dplyr::filter(level == "slide_level", Project.ID == "TCGA-COAD") |>
      dplyr::slice(1:n())
 
-catalog_read <- getCatalog("provgigapath") |> 
-    dplyr::filter(level == "slide_level", Project.ID == "TCGA-READ") |>
-   dplyr::slice(1:n())
-
 ov_catalog <- getCatalog("provgigapath") |> 
     dplyr::filter(level == "slide_level", Project.ID == "TCGA-OV") |>
   dplyr::slice(1:n())
@@ -68,19 +64,47 @@ OV_assays_subset <- c(
 ov_mae <- OV_mae_all[,,which(names(OV_mae_all) %in% OV_assays_subset)]
 
 
+
+#------------------------------------------
+# Load COAD assays
+#------------------------------------------
+
+COAD_mae_all <- curatedTCGAData(
+  diseaseCode = "COAD",
+  assays = "*",
+  version = "2.1.1",
+  dry.run = FALSE
+)
+
+COAD_assays_subset <- c(
+    "COAD_RNASeq2GeneNorm-20160128", # RNAseq
+    "COAD_Methylation_methyl450-20160128", # Methylation
+    "COAD_RPPAArray-20160128") # Proteomics
+COAD_mae <- COAD_mae_all[,,which(names(COAD_mae_all) %in% COAD_assays_subset)]
+
+
 ```
 
 
 # Link OV MAE data to the MultiAssayExperiment using linkTCGA
 
 ```{r linktcga}
-
+# OV mae DATA
 ov_mae_emb <-
     linkTCGA(ov_mae, ov_catalog, redownload = FALSE, parallel = FALSE)
 
 ## create artificial rownames for MOFA2
 rownames(ov_mae_emb[["slide_assay"]]) <-
     paste0("slide_feat_", seq_len(nrow(ov_mae_emb[["slide_assay"]])))
+
+
+# COAD MAE dats
+coad_mae_emb <-
+    linkTCGA(COAD_mae, catalog_coad, redownload = TRUE, parallel = TRUE)
+
+## create artificial rownames for MOFA2
+rownames(coad_mae_emb[["slide_assay"]]) <-
+    paste0("slide_feat_", seq_len(nrow(coad_mae_emb[["slide_assay"]])))
 ```
 
 # Run MOFA
