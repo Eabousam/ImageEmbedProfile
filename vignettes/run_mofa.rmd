@@ -157,14 +157,6 @@ plot_variance_explained(mofa_object.trained)
 ```{r}
 #| label: train-mofa-model
 
-# Run/train the model 
-
-mofa_object.trained <- run_mofa(
-  mofa_object,
-  outfile = "mofa_model_rnaseq_lastembed.hdf5",
-  use_basilisk = TRUE
-)
-
 # Load trained MOFA model
 mofa_object.trained <- load_model("mofa_model_rnaseq_lastembed.hdf5")
 
