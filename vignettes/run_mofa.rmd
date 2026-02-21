@@ -58,9 +58,10 @@ OV_mae_all <- curatedTCGAData(
 )
 
 OV_assays_subset <- c(
-    "OV_RNASeq2GeneNorm-20160128", # RNAseq
-    "OV_Methylation_methyl450-20160128", # Methylation
-    "OV_RPPAArray-20160128") # Proteomics
+    "OV_RNASeq2GeneNorm-20160128", # Gene expression (mRNA abundance).
+    "OV_RPPAArray-20160128", # Methylation (Epigenetic regulation of gene expression.)
+    #"OV_RPPAArray-20160128",# Proteomics (Protein abundance and phosphorylation levels (~200 proteins).)
+    "OV_GISTIC_AllByGene-20160128") # Discrete copy number changes per gene (−2 deletion → +2 amplification).
 ov_mae <- OV_mae_all[,,which(names(OV_mae_all) %in% OV_assays_subset)]
 
 
@@ -75,18 +76,27 @@ COAD_mae_all <- curatedTCGAData(
   version = "2.1.1",
   dry.run = FALSE
 )
-
-COAD_assays_subset <- c(
+COAD_assays_subset <- c("COAD_GISTIC_AllByGene-20160128", # (copy number)
     "COAD_RNASeq2GeneNorm-20160128", # RNAseq
-    "COAD_Methylation_methyl450-20160128", # Methylation
-    "COAD_RPPAArray-20160128") # Proteomics
-COAD_mae <- COAD_mae_all[,,which(names(COAD_mae_all) %in% COAD_assays_subset)]
+    "COAD_RPPAArray-20160128")# Proteomics
 
+COAD_mae <- COAD_mae_all[,,which(names(COAD_mae_all) %in% COAD_assays_subset)]
 
 ```
 
+```{r}
+# check intersecting patients
 
-# Link OV MAE data to the MultiAssayExperiment using linkTCGA
+common_prim <- Reduce(intersect, list(
+    TCGAutils::TCGAbarcode(colnames(OV_mae_all[["OV_RNASeq2GeneNorm-20160128"]])),
+    TCGAutils::TCGAbarcode(colnames(OV_mae_all[["OV_RPPAArray-20160128"]])),
+    TCGAutils::TCGAbarcode(colnames(OV_mae_all[["OV_RNASeq2GeneNorm-20160128"]]))
+))
+```
+
+
+
+# Link OV and COAD MAE data to the MultiAssayExperiment using linkTCGA
 
 ```{r linktcga}
 # OV mae DATA
@@ -97,7 +107,42 @@ ov_mae_emb <-
 rownames(ov_mae_emb[["slide_assay"]]) <-
     paste0("slide_feat_", seq_len(nrow(ov_mae_emb[["slide_assay"]])))
 
+slide_samples <- colnames(ov_mae_emb[["slide_assay"]])
 
+
+## Make sure the assays align
+ov_mae_emb_aligned <- list()
+for (nm in names(experiments(ov_mae_emb))) {
+  se <- experiments(ov_mae_emb)[[nm]]
+  mat <- assay(se)  # extract the assay matrix
+  
+  # Create a new matrix with the same rows but only slide_samples columns, filled with NA
+  new_mat <- matrix(NA, 
+                    nrow = nrow(mat), 
+                    ncol = length(slide_samples),
+                    dimnames = list(rownames(mat), slide_samples))
+  
+  # Find columns in this assay that correspond to slide samples
+  common <- intersect(colnames(mat), slide_samples)
+  if (length(common) > 0) {
+    new_mat[, common] <- mat[, common, drop = FALSE]
+  }
+  
+  # To make sure they're all numeric (GSIC was character), convert to numeric if needed
+  if (!is.numeric(new_mat)) {
+    new_mat <- matrix(as.numeric(new_mat), 
+                      nrow = nrow(new_mat), 
+                      dimnames = dimnames(new_mat))
+  }
+  
+  ov_mae_emb_aligned[[nm]] <- new_mat
+}
+
+
+
+```
+
+```{r}
 # COAD MAE dats
 coad_mae_emb <-
     linkTCGA(COAD_mae, catalog_coad, redownload = TRUE, parallel = TRUE)
@@ -105,13 +150,45 @@ coad_mae_emb <-
 ## create artificial rownames for MOFA2
 rownames(coad_mae_emb[["slide_assay"]]) <-
     paste0("slide_feat_", seq_len(nrow(coad_mae_emb[["slide_assay"]])))
+
+## Make sure the assays align
+coad_mae_emb_aligned <- list()
+for (nm in names(experiments(coad_mae_emb))) {
+  se <- experiments(coad_mae_emb)[[nm]]
+  mat <- assay(se)  # extract the assay matrix
+  
+  # Create a new matrix with the same rows but only slide_samples columns, filled with NA
+  new_mat <- matrix(NA, 
+                    nrow = nrow(mat), 
+                    ncol = length(slide_samples),
+                    dimnames = list(rownames(mat), slide_samples))
+  
+  # Find columns in this assay that correspond to slide samples
+  common <- intersect(colnames(mat), slide_samples)
+  if (length(common) > 0) {
+    new_mat[, common] <- mat[, common, drop = FALSE]
+  }
+  
+  # To make sure they're all numeric (GSIC was character), convert to numeric if needed
+  if (!is.numeric(new_mat)) {
+    new_mat <- matrix(as.numeric(new_mat), 
+                      nrow = nrow(new_mat), 
+                      dimnames = dimnames(new_mat))
+  }
+  
+  coad_mae_emb_aligned[[nm]] <- new_mat
+}
+
+
 ```
+
+
 
 # Run MOFA
 
 ```{r run_mofa}
 # Create MOFA object from MultiAssayExperiment
-mofa_obj <- create_mofa_from_MultiAssayExperiment(ov_mae_emb)
+mofa_obj <- create_mofa(ov_mae_emb_aligned)
 
 # Set data options
 data_opts <- get_default_data_options(mofa_obj)
@@ -135,222 +212,61 @@ mofa_obj <- prepare_mofa(
     model_options = model_opts,
     training_options = train_opts
 )
-test_model_file <- tempfile(fileext = ".hdf5")
+
 # Train the model
 mofa_obj.trained <- run_mofa(
     mofa_obj,
-    outfile = test_model_file,
+    outfile = "mofa_model_ovarian.hdf5" ,
     use_basilisk = TRUE
 )
 ```
 
+
+```{r}
+# 1. Verify that no matrix has zero rows after removing all‑NA features
+for (nm in names(ov_mae_emb_aligned)) {
+  mat <- ov_mae_emb_aligned[[nm]]
+  keep <- rowSums(!is.na(mat)) > 0
+  cat(nm, ": ", sum(!keep), " all‑NA rows\n")
+  ov_mae_emb_aligned[[nm]] <- mat[keep, , drop = FALSE]
+}
+# If any view now has 0 rows, that view is the culprit.
+
+# 2. Check that all matrices are numeric and have no constant rows (zero variance)
+for (nm in names(ov_mae_emb_aligned)) {
+  mat <- ov_mae_emb_aligned[[nm]]
+  sds <- apply(mat, 1, sd, na.rm = TRUE)
+  constant <- is.na(sds) | sds == 0
+  cat(nm, ": ", sum(constant), " constant rows\n")
+  # Optionally remove them
+  ov_mae_emb_aligned[[nm]] <- mat[!constant, , drop = FALSE]
+}
+
+# 3. Confirm that the slide_assay has no NAs (should be complete)
+cat("NAs in slide_assay:", sum(is.na(ov_mae_emb_aligned$slide_assay)), "\n")
+
+
+views <- names(ov_mae_emb_aligned)
+for (v in views) {
+  cat("Testing without", v, "\n")
+  temp <- try(create_mofa(ov_mae_emb_aligned[setdiff(views, v)]), silent = TRUE)
+  if (inherits(temp, "try-error")) {
+    cat("  Failed when removing", v, "\n")
+  } else {
+    cat("  Succeeded when removing", v, " – the issue is with view", v, "\n")
+  }
+}
+```
+
+
 # Visualize MOFA results
 
 ```{r load and visualize the model}
-mofa_object.trained <- load_model(test_model_file)
+mofa_object.trained <- load_model("mofa_model_coad.hdf5 2")
 
 plot_variance_explained(mofa_object.trained)
 ```
 
 
-
-```{r}
-#| label: train-mofa-model
-
-# Load trained MOFA model
-mofa_object.trained <- load_model("mofa_model_rnaseq_lastembed.hdf5")
-
-#------------------------------------------
-# 1. Get MOFA sample names
-#------------------------------------------
-mofa_samples <- unlist(samples_names(mofa_object.trained))  # vector of sample IDs
-
-#------------------------------------------
-# 2. Subset metadata to match MOFA samples
-#------------------------------------------
-metadata_matched <- metadata_df[mofa_samples, , drop = FALSE]
-
-# Ensure rownames match MOFA sample names exactly
-rownames(metadata_matched) <- mofa_samples
-
-#------------------------------------------
-# 3. Add sample column if needed
-#------------------------------------------
-metadata_matched$sample <- rownames(metadata_matched)
-
-#------------------------------------------
-# 4. Assign metadata to MOFA object
-#------------------------------------------
-samples_metadata(mofa_object.trained) <- metadata_matched
-
-# Save the updated object (RDS is easiest)
-saveRDS(mofa_object.trained, file = "mofa_model_lastembed_with_metadata.rds")
-
-
-# visualize the model views and samples
-plot_data_overview(mofa_object.trained)
-
-# Plot factor correlations to check for interdependence issues with the model
-plot_factor_cor(mofa_object.trained)
-
-
-# Plot variance explained
-plot_variance_explained(mofa_object.trained)
-
-plot_variance_explained(mofa_object.trained, plot_total = T)
-print(mofa_object.trained@cache$variance_explained)
-
-
-```
-
-
-
-## misc
-
-```{r}
-# Extract embedding matrices
-mat_layer0  <- assay(embedding_se_layer0, "embedding")
-mat_layer10 <- assay(embedding_se_layer10, "embedding")
-mat_layer11 <- assay(embedding_se_layer11, "embedding")
-mat_layer12 <- assay(embedding_se_layer12, "embedding")
-mat_last    <- assay(embedding_se_last, "embedding")
-
-# Calculate correlation between same embedding dimensions across layers
-layer_corr <- data.frame(
-  dim = rownames(mat_layer0),
-  cor_0_10  = diag(cor(t(mat_layer0), t(mat_layer10))),
-  cor_10_11 = diag(cor(t(mat_layer10), t(mat_layer11))),
-  cor_11_12 = diag(cor(t(mat_layer11), t(mat_layer12))),
-  cor_12_last = diag(cor(t(mat_layer12), t(mat_last)))
-)
-
-head(layer_corr)
-summary(layer_corr)
-```
-
-
-#### Load in TCGA CRC assay experiment data
-
-```{r}
-#| output: False
-#| message: false
-
-# List available Assays
-curatedTCGAData("COAD", "*",version = "2.1.1", dry.run = TRUE) 
-curatedTCGAData("READ", "*",version = "2.1.1", dry.run = TRUE) 
-
-
-# Load COAD data with multiple assays
-coad_mae_full <- curatedTCGAData(
-    diseaseCode = "COAD",
-    assays = c("COAD_RNASeq2GeneNorm-20160128", "mRNAArray", "miRNASeqGene"),
-    version = "2.1.1",
-    dry.run = FALSE
-)
-
-# Load READ data (rectal)
-read_mae_full <- curatedTCGAData(
-    diseaseCode = "READ",
-    assays = c("READ_RNASeq2GeneNorm-20160128", "mRNAArray", "miRNASeqGene"),
-    version = "2.1.1",
-    dry.run = FALSE
-)
-
-```
-
-#### Read Clinical Metadata data and subset
-
-```{r}
-#| output: False
-# ---- Extract sample-level metadata for READ ----- 
-read_clinical <- colData(read_mae_full)
-
-# Check completeness of metadata attributes
-completeness <- colSums(!is.na(read_clinical)) / nrow(read_clinical) * 100
-summary(completeness)
-
-# Subset to attributes with >95% completeness and remove technical fields
-read_clinical_sub <- read_clinical[, which(completeness > 95)] %>%
-  as.data.frame() %>%
-  select(-matches("aliquot")) %>%
-  select(-matches("portion"))
-
-
-# ------ Extract sample-level metadata for COAD ------
-coad_clinical <- colData(coad_mae_full)
-
-# Check completeness of metadata attributes
-completeness <- colSums(!is.na(coad_clinical)) / nrow(coad_clinical) * 100
-
-coad_clinical_sub <- coad_clinical[, which(completeness > 95)] %>%
-  as.data.frame() %>%
-  select(-matches("aliquot")) %>%
-  select(-matches("portion"))
-
-
-```
-
-#### Matching embedding with clinical metadata
-
-```{r}
-#| output: False
-# Merge COAD + READ clinical metadata
-all_cols <- union(colnames(coad_clinical_sub), colnames(read_clinical_sub))
-
-coad_clinical_full <- coad_clinical_sub
-for (col in setdiff(all_cols, colnames(coad_clinical_sub))) coad_clinical_full[[col]] <- NA
-
-read_clinical_full <- read_clinical_sub
-for (col in setdiff(all_cols, colnames(read_clinical_sub))) read_clinical_full[[col]] <- NA
-
-clinical_combined <- rbind(coad_clinical_full, read_clinical_full)
-
-# Keep only patients with embeddings
-# Convert embedding matrix rownames to patient IDs (first 3 components)
-patient_ids_from_embedding <- sapply(strsplit(rownames(tensor_matrix_full), "-"), 
-                                    function(x) paste(x[1:3], collapse = "-"))
-rownames(tensor_matrix_full) <- patient_ids_from_embedding
-
-# Convert clinical data rownames to patient IDs (first 3 components)
-clinical_patient_ids <- sapply(strsplit(rownames(clinical_combined), "-"), 
-                              function(x) paste(x[1:3], collapse = "-"))
-rownames(clinical_combined) <- clinical_patient_ids
-
-# Remove duplicate patients from clinical data (keep first occurrence)
-clinical_combined <- clinical_combined[!duplicated(rownames(clinical_combined)), ]
-
-# Keep only patients with embeddings
-patients_with_embed <- rownames(tensor_matrix_full)
-clinical_combined <- clinical_combined[rownames(clinical_combined) %in% patients_with_embed, ]
-
-# Factorize categorical variables with 2-10 unique values
-numLv <- apply(clinical_combined, 2, function(x) length(unique(na.omit(x))))
-slideAttrNames <- names(numLv[numLv >= 2 & numLv <= 10])
-
-for(attr in slideAttrNames){
-  clinical_combined[[attr]] <- as.factor(clinical_combined[[attr]])
-}
-
-# Create final metadata dataframe
-metadata_embed_df <- clinical_combined[slideAttrNames]
-
-# Remove any rows with all NA values
-metadata_embed_df <- metadata_embed_df[rowSums(is.na(metadata_embed_df)) < ncol(metadata_embed_df), ]
-
-# Subset embedding matrix to match metadata patients
-embedding_embed_mat <- tensor_matrix_full[rownames(tensor_matrix_full) %in% rownames(metadata_embed_df), ]
-embedding_embed_mat <- embedding_embed_mat[!duplicated(rownames(embedding_embed_mat)), ]
-
-# Ensure exact same patients in both datasets
-common_patients <- intersect(rownames(embedding_embed_mat), rownames(metadata_embed_df))
-embedding_embed_mat <- embedding_embed_mat[common_patients, ]
-metadata_embed_df <- metadata_embed_df[common_patients, ]
-
-# Run HistoImageR embedding separation analysis
-res_embed <- HistoImageR:::analyze_embedding_separation(embedding_embed_mat, metadata_embed_df)
-
-# View results
-res_embed$plots
-```
 
 
