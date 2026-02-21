@@ -107,35 +107,54 @@ ov_mae_emb <-
 rownames(ov_mae_emb[["slide_assay"]]) <-
     paste0("slide_feat_", seq_len(nrow(ov_mae_emb[["slide_assay"]])))
 
-slide_samples <- colnames(ov_mae_emb[["slide_assay"]])
+# ---- 1. Get patients with slide data ----
+slide_sm <- sampleMap(ov_mae_emb)[sampleMap(ov_mae_emb)$assay == "slide_assay", ]
+patients <- unique(slide_sm$primary)
 
-
-## Make sure the assays align
+# ---- 2. Prepare list to hold patient-level matrices ----
 ov_mae_emb_aligned <- list()
+
+# ---- 3. Process each assay ----
 for (nm in names(experiments(ov_mae_emb))) {
+  cat("Processing", nm, "\n")
   se <- experiments(ov_mae_emb)[[nm]]
-  mat <- assay(se)  # extract the assay matrix
+  mat <- assay(se)                     # features x samples matrix
   
-  # Create a new matrix with the same rows but only slide_samples columns, filled with NA
-  new_mat <- matrix(NA, 
-                    nrow = nrow(mat), 
-                    ncol = length(slide_samples),
-                    dimnames = list(rownames(mat), slide_samples))
+  # Get sampleMap for this assay
+  sm <- sampleMap(ov_mae_emb)[sampleMap(ov_mae_emb)$assay == nm, ]
   
-  # Find columns in this assay that correspond to slide samples
-  common <- intersect(colnames(mat), slide_samples)
-  if (length(common) > 0) {
-    new_mat[, common] <- mat[, common, drop = FALSE]
+  # Map each column to patient
+  col_patients <- sm$primary[match(colnames(mat), sm$colname)]
+  
+  # Create empty patient matrix (features x patients)
+  patient_mat <- matrix(NA, 
+                        nrow = nrow(mat), 
+                        ncol = length(patients),
+                        dimnames = list(rownames(mat), patients))
+  
+  # For each patient, average columns belonging to that patient
+  for (pat in patients) {
+    cols <- which(col_patients == pat)
+    if (length(cols) == 1) {
+      patient_mat[, pat] <- mat[, cols]
+    } else if (length(cols) > 1) {
+      patient_mat[, pat] <- rowMeans(mat[, cols, drop = FALSE], na.rm = TRUE)
+    }
+    # else: no data -> stays NA
   }
   
-  # To make sure they're all numeric (GSIC was character), convert to numeric if needed
-  if (!is.numeric(new_mat)) {
-    new_mat <- matrix(as.numeric(new_mat), 
-                      nrow = nrow(new_mat), 
-                      dimnames = dimnames(new_mat))
+  # Convert to numeric if needed (GISTIC sometimes character)
+  if (!is.numeric(patient_mat)) {
+    patient_mat <- matrix(as.numeric(patient_mat),
+                          nrow = nrow(patient_mat),
+                          dimnames = dimnames(patient_mat))
   }
   
-  ov_mae_emb_aligned[[nm]] <- new_mat
+  # Remove features that are all NA
+  keep <- rowSums(!is.na(patient_mat)) > 0
+  patient_mat <- patient_mat[keep, , drop = FALSE]
+  
+  ov_mae_emb_aligned[[nm]] <- patient_mat
 }
 
 
@@ -222,50 +241,16 @@ mofa_obj.trained <- run_mofa(
 ```
 
 
-```{r}
-# 1. Verify that no matrix has zero rows after removing all‑NA features
-for (nm in names(ov_mae_emb_aligned)) {
-  mat <- ov_mae_emb_aligned[[nm]]
-  keep <- rowSums(!is.na(mat)) > 0
-  cat(nm, ": ", sum(!keep), " all‑NA rows\n")
-  ov_mae_emb_aligned[[nm]] <- mat[keep, , drop = FALSE]
-}
-# If any view now has 0 rows, that view is the culprit.
-
-# 2. Check that all matrices are numeric and have no constant rows (zero variance)
-for (nm in names(ov_mae_emb_aligned)) {
-  mat <- ov_mae_emb_aligned[[nm]]
-  sds <- apply(mat, 1, sd, na.rm = TRUE)
-  constant <- is.na(sds) | sds == 0
-  cat(nm, ": ", sum(constant), " constant rows\n")
-  # Optionally remove them
-  ov_mae_emb_aligned[[nm]] <- mat[!constant, , drop = FALSE]
-}
-
-# 3. Confirm that the slide_assay has no NAs (should be complete)
-cat("NAs in slide_assay:", sum(is.na(ov_mae_emb_aligned$slide_assay)), "\n")
-
-
-views <- names(ov_mae_emb_aligned)
-for (v in views) {
-  cat("Testing without", v, "\n")
-  temp <- try(create_mofa(ov_mae_emb_aligned[setdiff(views, v)]), silent = TRUE)
-  if (inherits(temp, "try-error")) {
-    cat("  Failed when removing", v, "\n")
-  } else {
-    cat("  Succeeded when removing", v, " – the issue is with view", v, "\n")
-  }
-}
-```
 
 
 # Visualize MOFA results
 
 ```{r load and visualize the model}
-mofa_object.trained <- load_model("mofa_model_coad.hdf5 2")
+mofa_object.trained <- load_model("mofa_model_ovarian.hdf5")
 
 plot_variance_explained(mofa_object.trained)
 ```
+
 
 
 
