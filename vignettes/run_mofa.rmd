@@ -221,7 +221,9 @@ for (nm in names(experiments(coad_mae_emb))) {
 
 ## Create object and attach metadata for coad 
 
-```{r run_mofa}
+
+
+```{r}
 # Create MOFA object from MultiAssayExperiment
 mofa_obj <- create_mofa(coad_mae_emb_aligned)
 
@@ -241,6 +243,8 @@ meta_for_mofa <- data.frame(sample = sample_order, meta_for_mofa, row.names = NU
 
 # 4. Attach to MOFA object
 samples_metadata(mofa_obj) <- meta_for_mofa
+
+table(meta_for_mofa$patient.tissue_source_site)
 ```
 
 
