@@ -30,8 +30,7 @@ library(survival)
 library(survminer)
 library(curatedTCGAData)
 library(fgsea)
-library(msigdbr)  
-library(enrichplot)
+library(msigdbr)
 library(ggplot2)
 library(dplyr)
 library(genekitr)
@@ -40,33 +39,42 @@ library(Hmisc)
 library(pheatmap)
 library(DT)
 library(tidyverse)
-library(kableExtra)
-
-devtools::load_all()
+library(ggpubr)
 
 ```
 
 #### Analyze MOFA model
 
-```{r, include =TRUE, echo = TRUE}
-#| label: load-mofa
-# Load trained MOFA model
+```{r load-mofa, include =TRUE, echo = TRUE}
 
-#mofa_object.trained <- readRDS("mofa_model_with_metadata.rds")
-mofa_object.trained <- readRDS("mofa_model_lastembed_with_metadata.rds")
+# READ mofa ovarian cancer
+mofa_object.ov <- load_model("mofa_model_ov.hdf5")
+
+# READ mofa Colon cancer
+mofa_object.colon <- load_model("mofa_model_colon.hdf5")
+
+
+
+```
+
+
+```{r}
 # visualize the model views and samples
-plot_data_overview(mofa_object.trained)
-samples_metadata(mofa_object.trained) <- metadata_matched
-names(metadata_matched)
+plot_data_overview(mofa_object.colon)
+plot_data_overview(mofa_object.ov)
+
+# Check metadata for both objects
+ov_metadata = samples_metadata(mofa_object.ov)
+coad_metadata = samples_metadata(mofa_object.colon)
+
 # Plot factor correlations to check for interdependence issues with the model
-plot_factor_cor(mofa_object.trained)
+plot_factor_cor(mofa_object.ov)
+plot_factor_cor(mofa_object.colon)
 
 
 # Plot variance explained
-plot_variance_explained(mofa_object.trained, plot_total = TRUE)
-
-print(mofa_object.trained@cache$variance_explained)
-
+plot_variance_explained(mofa_object.colon)
+plot_variance_explained(mofa_object.ov)
 
 
 ```
@@ -77,33 +85,30 @@ print(mofa_object.trained@cache$variance_explained)
 #| label: mofa-visualization
 #| warning: false
 
-
-
-
 # Plot data heatmaps
 # using rna seq view
-plot_data_heatmap(mofa_object.trained,
+plot_data_heatmap(mofa_object.colon,
                    scale = "row",
                    cluster_cols = FALSE,
                    cluster_rows = FALSE,
                    show_colnames = FALSE,
                    denoise = TRUE,
                    features = 10,
-                   view = "RNASeq",
+                   view = "COAD_RNASeq2GeneNorm-20160128",
                    factor=1)
 
 # Using embedding view
-plot_data_heatmap(mofa_object.trained,
+plot_data_heatmap(mofa_object.colon,
                   factor = 1,
-                  view = "Embedding_last",
+                  view = "slide_assay",
                   features = 10,
                   cluster_rows = FALSE,
                   cluster_cols = FALSE,
                   show_colnames = FALSE)
 
 # Plot top weights 
-plot_top_weights(mofa_object.trained,
-                 view = "RNASeq",
+plot_top_weights(mofa_object.colon,
+                 view = "slide_assay",
                  factor = 1,
                  nfeatures = 10)
 
@@ -116,9 +121,9 @@ plot_factor(mofa_object.trained,
             color_by = "MYH11")
 
 # Plot factor scatter
-plot_factor(mofa_object.trained, 
+plot_factor(mofa_object.ov, 
             factor = c(1, 2), 
-            color_by = "pathology_T_stage")
+            color_by = "patient.tissue_source_site")
 
 plot_top_weights(mofa_object.trained,
                  view = "Embedding_last",
@@ -126,12 +131,43 @@ plot_top_weights(mofa_object.trained,
                  nfeatures = 10)
 
 # Correlate factors with clinical variables
-correlate_factors_with_covariates(mofa_object.trained, 
-                      covariates = c("vital_status.x","pathology_M_stage","tumor_tissue_site"), 
+coad_metadata$vital_status.x
+correlate_factors_with_covariates(mofa_object.colon, 
+                                  factors = "all",
+                      covariates = c("patient.tissue_source_site", "vital_status.x" ,"pathologic_stage", "patient.age_at_initial_pathologic_diagnosis", "patient.clinical_cqcf.history_of_prior_malignancy"), 
+                      plot = "log_pval" )
+
+correlate_factors_with_covariates(mofa_object.ov, 
+                                  factors = "all",
+                      covariates = c("patient.tissue_source_site", "vital_status" ,"k4", "patient.age_at_initial_pathologic_diagnosis"), 
                       plot = "log_pval" )
 
 
 
+plot_factor( mofa_object.ov,
+             dodge = TRUE,
+             add_violin = TRUE,
+             color_by = "patient.age_at_initial_pathologic_diagnosis",
+             factors=1:6)
+
+plot_factor( mofa_object.ov,
+             dodge = TRUE,
+             add_violin = TRUE,
+             color_by = "vital_status",
+             factors=10:14)
+
+
+plot_top_weights( mofa_object.ov,
+                  view = "OV_RNASeq2GeneNorm-20160128",
+                  nfeatures = 15,
+                  scale = T,
+                  factor=1)
+
+plot_factor( mofa_object.ov,
+             dodge = TRUE,
+             add_violin = TRUE,
+             color_by = "FPR1",
+             factors=1:5)
 ```
 
 # Factor Contribution
@@ -214,7 +250,7 @@ ggplot(cum_sum_df, aes(x = Factor, y = Cumsum, color = View)) +
 ```
 
 ```{r}
-plot_weights(mofa_object.trained, 
+plot_weights(mofa_object.colon, 
              view = 2, 
              factor = 3, 
              nfeatures = 10)
@@ -592,6 +628,8 @@ surv_df <- factor3_cluster_df %>%
   filter(!is.na(time), !is.na(event), !is.na(cluster))
 
 
+table(factor3_cluster_df$patient.tissue_source_site, factor3_cluster_df$cluster, useNA="ifany")
+
 
 # Range of time variable (should be in days, positive)
 range(surv_df$time, na.rm = TRUE)
@@ -630,15 +668,252 @@ ph_test
 plot(ph_test)        # diagnostic plots for each covariate
 
 # cox table
-table(surv_df$hist_type, surv_df$event)
-table(surv_df$hist_type, surv_df$cluster)
+table(surv_df$cluster, surv_df$event)
+table(surv_df$histological_type.x, surv_df$cluster)
 cox_tbl <- tidy(cox_fit_multi, exponentiate = TRUE, conf.int = TRUE)
 cox_tbl <- cox_tbl %>%
   select(term, estimate, conf.low, conf.high, p.value) %>%
   rename(HR = estimate, CI_low = conf.low, CI_high = conf.high, pval = p.value)
 
-cox_tbl
+# Epi table 1 stratified by cluster
+library("gtsummary")
+library(dplyr)
+# ensure factors etc. already defined
+# table 1 by cluster
+table1_cluster <- surv_df %>%
+  select(cluster, age, gender, stage, site, hist_type, time, event) %>%
+  tbl_summary(
+    by = cluster,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "ifany",
+    digits = all_continuous() ~ 1
+  ) %>%
+  modify_header(label ~ "**Variable**") %>%
+  bold_labels()
+
+# diagnostics by cluster
+diagnostics_cluster <- factor3_cluster_df %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    n_dead = sum(patient.vital_status == "dead", na.rm = TRUE),
+    n_alive = sum(patient.vital_status == "alive", na.rm = TRUE),
+    missing_death = sum(is.na(days_to_death.x)),
+    missing_last_followup = sum(is.na(patient.days_to_last_followup)),
+    missing_last_alive = sum(is.na(patient.days_to_last_known_alive)),
+    zero_followup = sum(patient.days_to_last_followup <= 0, na.rm = TRUE),
+    zero_known_alive = sum(patient.days_to_last_known_alive <= 0, na.rm = TRUE)
+  )
+
+
+
+# view both
+table1_cluster
+diagnostics_cluster
+library(gt)
+
+# Save full table as PNG
+gtsave(as_gt(table1_cluster),
+       filename = "table1_cluster.png",
+       vwidth = 1800,
+       vheight = 2400)
+
+
+factor3_cluster_df %>%
+  group_by(cluster, patient.tumor_tissue_site, year = patient.year_of_initial_pathologic_diagnosis) %>%
+  summarise(
+    n = n(),
+    median_followup = median(patient.days_to_last_followup, na.rm = TRUE),
+    zero_followup = sum(patient.days_to_last_followup <= 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+table(factor3_cluster_df$admin.bcr)
+
+names(factor3_cluster_df)
+
+
+candidate_vars <- c(
+  "patient.tumor_tissue_site",
+  "tumor_tissue_site",
+  "date_of_initial_pathologic_diagnosis",
+  "patient.year_of_initial_pathologic_diagnosis",
+  "patient.month_of_form_completion",
+  "patient.age_at_initial_pathologic_diagnosis",
+  "patient.gender",
+  "patient.histological_type",
+  "admin.patient_withdrawal.withdrawn",
+  "patient.biospecimen_cqcf.digital_image_submitted",
+  "patient.biospecimen_cqcf.top_slide_submitted"
+)
+
+for (v in candidate_vars) {
+  print(v)
+  print(table(factor3_cluster_df[[v]], factor3_cluster_df$cluster, useNA="ifany"))
+}
+
+table(metadata$patient.biospecimen_cqcf.top_slide_submitted)
+
+table(factor3_cluster_df$patient.year_of_initial_pathologic_diagnosis,
+      factor3_cluster_df$cluster, useNA="ifany")
 ```
+
+```{r}
+# 1. Examine zero follow-up rows
+zero_fup <- factor3_cluster_df %>%
+  filter(cluster == 1, patient.days_to_last_followup <= 0 | is.na(patient.days_to_last_followup)) %>%
+  select(patient.vital_status, days_to_death.x,
+         patient.days_to_last_followup, patient.days_to_last_known_alive, tumor_tissue_site)
+
+nrow(zero_fup)
+
+# 2. Check overlap: how many have alternative time variables?
+zero_fup %>%
+  summarise(
+    has_known_alive = sum(!is.na(patient.days_to_last_known_alive)),
+    has_death_time  = sum(!is.na(days_to_death.x))
+  )
+
+# 3. Inspect distribution of last known alive times
+hist(zero_fup$patient.days_to_last_known_alive)
+
+# 4. Compare with cluster 2 for pattern differences
+factor3_cluster_df %>%
+  group_by(cluster) %>%
+  summarise(
+    mean_followup = mean(patient.days_to_last_followup, na.rm = TRUE),
+    mean_alive_known = mean(patient.days_to_last_known_alive, na.rm = TRUE)
+  )
+```
+
+# Analyse missingness
+
+
+```{r}
+# 2. Systematic missingness analysis
+missingness_analysis <- function(data) {
+  # Create missingness indicators
+  data <- data %>%
+    mutate(
+      missing_death = is.na(days_to_death.x),
+      missing_followup = is.na(patient.days_to_last_followup),
+      zero_followup = patient.days_to_last_followup <= 0,
+      short_followup = patient.days_to_last_followup < 365  # < 1 year
+    )
+  
+  # Test association with cluster
+  missing_tests <- list(
+    death_missing = glm(missing_death ~ cluster, data = data, family = binomial),
+    followup_missing = glm(missing_followup ~ cluster, data = data, family = binomial),
+    zero_followup_test = glm(zero_followup ~ patient.biospecimen_cqcf.top_slide_submitted, data = data, family = binomial),
+    short_followup_test = glm(short_followup ~ cluster, data = data, family = binomial)
+  )
+  
+  return(missing_tests)
+}
+
+names(factor3_cluster_df)
+table(factor3_cluster_df$admin.bcr,
+      factor3_cluster_df$cluster, useNA="ifany")
+
+missing_results <- missingness_analysis(factor3_cluster_df)
+lapply(missing_results, summary)
+```
+
+
+* strong association between if top slide image submitted and zero follow up
+
+       1   2
+  no   224 362
+  yes    0  19
+
+
+```{r}
+# Critical technical variables:
+critical_vars <- c(
+  "patient.tissue_source_site",           # Different collection sites
+  "admin.year_of_dcc_upload",             # Data processing batches
+  "admin.month_of_dcc_upload",            # More granular timing
+  "patient.samples.sample.is_ffpe",       # Sample processing method
+  "patient.biospecimen_cqcf.method_of_sample_procurement", # How samples were obtained
+  "patient.tissue_prospective_collection_indicator", # Prospective vs retrospective
+  "patient.tissue_retrospective_collection_indicator"
+)
+
+# Check each one properly
+for (var in critical_vars) {
+  if(var %in% names(factor3_cluster_df)) {
+    cat("\n=== ", var, " ===\n")
+    print(table(factor3_cluster_df[[var]], factor3_cluster_df$cluster, useNA = "ifany"))
+  }
+}
+```
+
+
+
+```{r}
+# Check missingness patterns by tissue source site
+missingness_by_site <- factor3_cluster_df %>%
+  group_by(patient.tissue_source_site) %>%
+  summarise(
+    n = n(),
+    n_in_cluster1 = sum(cluster == 1),
+    prop_cluster1 = n_in_cluster1 / n,
+    
+    # Missingness metrics
+    missing_death = sum(is.na(days_to_death.x)),
+    prop_missing_death = missing_death / n,
+    
+    missing_followup = sum(is.na(patient.days_to_last_followup)),
+    prop_missing_followup = missing_followup / n,
+    
+    zero_followup = sum(patient.days_to_last_followup <= 0, na.rm = TRUE),
+    prop_zero_followup = zero_followup / n,
+    
+    mean_followup = mean(patient.days_to_last_followup, na.rm = TRUE),
+    median_followup = median(patient.days_to_last_followup, na.rm = TRUE)
+  ) %>%
+  arrange(desc(prop_cluster1))
+
+# Look at the top sites (those with highest proportion in Cluster 1)
+head(missingness_by_site, 10)
+
+
+```
+
+* Issue with sites aa and ag, mostly retrospective, sites for Indivumed	dominates cluster 1 and has high missingness and zero follow up
+
+* Notes
+
+- Cluster 2 has 94.4% lower odds of having zero follow-up time
+
+- Each increasing year is associated with higher odds of being in Cluster 2
+
+- Cluster 2 has 95.6% lower odds of having short follow-up
+
+* Cluster 1 is almost entirely retrospective samples
+
+* Cluster 2 is mixed but predominantly prospective
+
+
+
+```{r}
+
+
+# Test 1: Adjust for the real confounders in FULL dataset
+cluster_surv_cens <- coxph(Surv(time, event) ~ cluster + age + gender + stage + 
+   + patient.tissue_prospective_collection_indicator + patient.tissue_source_site+
+                       patient.year_of_initial_pathologic_diagnosis,
+                     data = surv_df)
+
+
+
+```
+
+
 
 
 
@@ -705,6 +980,7 @@ ggplot(r2_df_mofa_factors, aes(
 
 
 
+
 # Gene set Analysis
 
 ```         
@@ -713,6 +989,8 @@ ggplot(r2_df_mofa_factors, aes(
 ```
 
 ## Gene sets
+
+
 
 ```{r, GSEA, include=TRUE, echo=TRUE}
 
