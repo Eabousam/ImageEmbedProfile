@@ -84,16 +84,6 @@ COAD_mae <- COAD_mae_all[,,which(names(COAD_mae_all) %in% COAD_assays_subset)]
 
 ```
 
-```{r}
-# check intersecting patients
-
-common_prim <- Reduce(intersect, list(
-    TCGAutils::TCGAbarcode(colnames(OV_mae_all[["OV_RNASeq2GeneNorm-20160128"]])),
-    TCGAutils::TCGAbarcode(colnames(OV_mae_all[["OV_RPPAArray-20160128"]])),
-    TCGAutils::TCGAbarcode(colnames(OV_mae_all[["OV_RNASeq2GeneNorm-20160128"]]))
-))
-```
-
 
 
 # Link OV and COAD MAE data to the MultiAssayExperiment using linkTCGA
@@ -170,32 +160,52 @@ coad_mae_emb <-
 rownames(coad_mae_emb[["slide_assay"]]) <-
     paste0("slide_feat_", seq_len(nrow(coad_mae_emb[["slide_assay"]])))
 
-## Make sure the assays align
+slide_sm <- sampleMap(coad_mae_emb)[sampleMap(coad_mae_emb)$assay == "slide_assay", ]
+patients_with_slide <- unique(slide_sm$primary)   # these are the patients we care about
+
+# 2. Prepare an empty list for patient-level matrices
 coad_mae_emb_aligned <- list()
+
+# 3. Loop over all assays
 for (nm in names(experiments(coad_mae_emb))) {
   se <- experiments(coad_mae_emb)[[nm]]
-  mat <- assay(se)  # extract the assay matrix
+  mat <- assay(se)   # features x samples
   
-  # Create a new matrix with the same rows but only slide_samples columns, filled with NA
-  new_mat <- matrix(NA, 
+  # Get sampleMap for this assay
+  sm <- sampleMap(coad_mae_emb)[sampleMap(coad_mae_emb)$assay == nm, ]
+  
+  # Map each column to patient
+  col_patients <- sm$primary[match(colnames(mat), sm$colname)]
+  
+  # Create empty patient matrix (features x patients_with_slide)
+  pat_mat <- matrix(NA, 
                     nrow = nrow(mat), 
-                    ncol = length(slide_samples),
-                    dimnames = list(rownames(mat), slide_samples))
+                    ncol = length(patients_with_slide),
+                    dimnames = list(rownames(mat), patients_with_slide))
   
-  # Find columns in this assay that correspond to slide samples
-  common <- intersect(colnames(mat), slide_samples)
-  if (length(common) > 0) {
-    new_mat[, common] <- mat[, common, drop = FALSE]
+  # For each patient, average columns belonging to that patient
+  for (pat in patients_with_slide) {
+    cols <- which(col_patients == pat)
+    if (length(cols) == 1) {
+      pat_mat[, pat] <- mat[, cols]
+    } else if (length(cols) > 1) {
+      pat_mat[, pat] <- rowMeans(mat[, cols, drop = FALSE], na.rm = TRUE)
+    }
+    # else: no data -> stays NA
   }
   
-  # To make sure they're all numeric (GSIC was character), convert to numeric if needed
-  if (!is.numeric(new_mat)) {
-    new_mat <- matrix(as.numeric(new_mat), 
-                      nrow = nrow(new_mat), 
-                      dimnames = dimnames(new_mat))
+  # Convert to numeric if needed
+  if (!is.numeric(pat_mat)) {
+    pat_mat <- matrix(as.numeric(pat_mat), 
+                      nrow = nrow(pat_mat), 
+                      dimnames = dimnames(pat_mat))
   }
   
-  coad_mae_emb_aligned[[nm]] <- new_mat
+  # Remove features that are all NA
+  keep <- rowSums(!is.na(pat_mat)) > 0
+  pat_mat <- pat_mat[keep, , drop = FALSE]
+  
+  coad_mae_emb_aligned[[nm]] <- pat_mat
 }
 
 
@@ -207,7 +217,7 @@ for (nm in names(experiments(coad_mae_emb))) {
 
 ```{r run_mofa}
 # Create MOFA object from MultiAssayExperiment
-mofa_obj <- create_mofa(ov_mae_emb_aligned)
+mofa_obj <- create_mofa(coad_mae_emb_aligned)
 
 # Set data options
 data_opts <- get_default_data_options(mofa_obj)
@@ -232,10 +242,10 @@ mofa_obj <- prepare_mofa(
     training_options = train_opts
 )
 
-# Train the model
+# Train the model  
 mofa_obj.trained <- run_mofa(
     mofa_obj,
-    outfile = "mofa_model_ovarian.hdf5" ,
+    outfile = "mofa_model_colon.hdf5" ,
     use_basilisk = TRUE
 )
 ```
