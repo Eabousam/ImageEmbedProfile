@@ -76,7 +76,6 @@ plot_factor_cor(mofa_object.colon)
 plot_variance_explained(mofa_object.colon)
 plot_variance_explained(mofa_object.ov)
 
-
 ```
 
 #### Initial visualizations
@@ -179,7 +178,7 @@ plot_factor( mofa_object.ov,
 
 # 1. Extract loadings (factor weights) for each view
 #    MOFA provides loadings per view (e.g. RNASeq, embeddings).
-loadings_rnaseq_list <- get_weights(mofa_object.trained, views = "RNASeq")
+loadings_rnaseq_list <- get_weights(mofa_object.ov, views = "RNASeq")
 loadings_embed_list  <- get_weights(mofa_object.trained, views = "Embedding_layer0")
 
 # 2. Convert lists of loadings into numeric matrices
@@ -257,331 +256,9 @@ plot_weights(mofa_object.colon,
 # if we have tile embeddings with some coords, we can figure out where they are in the slide image??
 ```
 
-# PCA interpretation
 
-### Matrices
 
-```{r}
-#==============================================================
-# 1. Get factor scores
-#==============================================================
-factor_scores <- get_factors(mofa_object.trained, factors = "all", as.data.frame = FALSE)[[1]] %>%
-  as.data.frame() %>%
-  tibble::rownames_to_column("patient_id")
-
-#==============================================================
-# 2. Load embeddings (last layer only)
-#==============================================================
-devtools::load_all()  # contains getEmbeddingLayer()
-
-participant_ids <- gsub(".csv$", "", basename(fnames)) %>% 
-  strsplit(., "-") %>% 
-  sapply(\(x) paste(x[1:3], collapse = "-"))
-
-structure_last <- getEmbeddingLayer(fnames, participant_ids, layer = "last_layer_embed")
-
-#==============================================================
-# 3. Align patients between MOFA factors and embeddings
-#==============================================================
-shared_ids <- intersect(rownames(structure_last), factor_scores$patient_id)
-
-embedding_matched <- structure_last[shared_ids, , drop = FALSE]
-factor_scores_matched <- factor_scores[factor_scores$patient_id %in% shared_ids, ]
-rownames(factor_scores_matched) <- factor_scores_matched$patient_id
-factor_scores_matched <- factor_scores_matched[shared_ids, , drop = FALSE]
-
-#==============================================================
-# 4. Table 1: Correlation (factors × embedding dims)
-#==============================================================
-cor_mat <- cor(
-  factor_scores_matched[, -1],
-  embedding_matched,
-  use = "pairwise.complete.obs"
-)
-
-embedding_corr_table <- as.data.frame(cor_mat) %>%
-  tibble::rownames_to_column("Factor") %>%
-  tidyr::pivot_longer(-Factor,
-                      names_to = "Embedding_Dimension",
-                      values_to = "Correlation") %>%
-  dplyr::mutate(Abs_Corr = abs(Correlation)) %>%
-  dplyr::arrange(Factor, desc(Abs_Corr))
-
-#==============================================================
-# 5. Table 2: Top weighted embeddings from MOFA
-#==============================================================
-embedding_weights <- get_weights(mofa_object.trained, view = "Embedding_last", as.data.frame = FALSE)[[1]]
-
-embedding_weight_table <- lapply(seq_len(ncol(embedding_weights)), function(f) {
-  tibble::tibble(
-    Factor = colnames(embedding_weights)[f],
-    Embedding_Dimension = rownames(embedding_weights),
-    Weight = embedding_weights[, f],
-    Abs_Weight = abs(embedding_weights[, f])
-  ) %>%
-    dplyr::arrange(desc(Abs_Weight)) %>%
-    dplyr::slice_head(n = 20)  # top 20 per factor
-}) %>%
-  dplyr::bind_rows()
-
-#==============================================================
-# Outputs
-#==============================================================
-head(embedding_corr_table)
-head(embedding_weight_table)
-```
-
-
-
-# Exploring Embeddings
-
-```{r}
-# PCA on embeddings
-pca_res <- prcomp(embedding_matched, scale. = TRUE)
-
-# Examine variance explained
-summary(pca_res)
-
-# Get sample scores (N x components)
-pca_scores <- as.data.frame(pca_res$x)
-head(pca_scores)
-
-# Correlate PCA components with MOFA factor scores
-pca_factor_cor <- cor(pca_scores, factor_scores_matched[, -1], use = "pairwise.complete.obs")
-
-
-# visualize first two PCs
-ggplot(pca_scores, aes(PC1, PC2)) +
-  geom_point(color = "gray40") +
-  theme_minimal() +
-  labs(title = "PCA of Image Embeddings",
-       x = paste0("PC1 (", round(summary(pca_res)$importance[2,1]*100, 1), "% var)"),
-       y = paste0("PC2 (", round(summary(pca_res)$importance[2,2]*100, 1), "% var)"))
-
-ggplot(pca_scores %>% cbind(df), aes(PC1, PC2, color = cluster)) + geom_point()
-
-
-```
-
-
-
-```{r}
-# Clinical variables to test
-clin_vars <- c("tumor_tissue_site", "gender", "histological_type",
-              "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
-              "pathologic_stage")
-
-# Initialize list to store R² results
-r2_results <- list()
-
-for (v in clin_vars) {
-  if (!v %in% names(df)) next
-  r2_vec <- sapply(names(pca_scores), function(pc) {
-    f <- as.formula(paste(pc, "~", v))
-    mod <- lm(f, data = cbind(df, pca_scores))
-    summary(mod)$r.squared
-  })
-  r2_results[[v]] <- data.frame(
-    PC = names(pca_scores),
-    R2 = r2_vec,
-    variable = v
-  )
-}
-
-r2_df <- do.call(rbind, r2_results)  %>%
-  dplyr::filter(as.numeric(gsub("PC", "", PC)) <= 60)
-
-
-# Plot
-r2_df$PC <- as.numeric(gsub("PC", "", r2_df$PC))
-
-ggplot(r2_df, aes(x = PC, y = R2, color = variable, group = variable)) +
-  geom_line() +
-  geom_point(size = 1.2) +
-  scale_x_continuous(
-    breaks = seq(0, 60, 10),
-    labels = seq(0, 60, 10),
-    expand = c(0, 0)
-  ) +
-  theme_bw(base_size = 12) +
-  theme(
-    panel.grid.minor = element_blank(),
-    axis.text.x = element_text(angle = 0, vjust = 0.5)
-  ) +
-  labs(
-    title = "Variance in PCA Components Explained by Clinical Variables",
-    x = "PC",
-    y = expression(R^2 ~ " (from linear model)")
-  )
-
-```
-
-
-
-
-# Projection of embeddings
-
-```{r}
-# matrices
-X <- as.matrix(embedding_matched)                 # N x D
-Y <- as.matrix(factor_scores_matched[ , -1 ])     # N x F
-
-# center/scale X and Y as needed
-Xs <- scale(X)          # mean 0, sd 1
-Ys <- scale(Y)
-
-W <- as.matrix(embedding_weights)    # D x F (rownames = embedding dims, colnames = Factor names)
-
-# choose factor j (or loop)
-j <- "Factor3"
-w_j <- W[, j]                        # length D
-
-# project each sample into that MOFA-derived direction
-proj_wj <- Xs %*% w_j                # N x 1
-
-# compare to factor scores
-cor(proj_wj, Ys[, j])
-plot(
-  Ys[, j], proj_wj,
-  xlab = paste("MOFA factor", j, "score"),
-  ylab = "Projection on embedding weights",
-  main = paste("Embedding–Factor association:", j),
-  pch = 16, col = "gray40"
-)
-abline(lm(proj_wj ~ Ys[, j]), col = "red", lwd = 2)
-
-
-heatmap(embedding_weights, scale = "row",
-        xlab = "MOFA factors", ylab = "Embedding dimensions",
-        main = "Embedding–Factor weight structure")
-
-
-
-```
-
-
-# Analyse clusters of embeddings projection Factor 3
-
-```{r}
-
-library(dplyr)
-library(ggplot2)
-library(glue)
-
-# --- 1. Cluster assignment and merge metadata
-proj <- Xs %*% W[, "Factor3"]
-
-# kmeans ** note: could use other clustering methods
-
-# run k-means on the projection or embeddings
-km <- kmeans(proj, centers = 2, nstart = 20)
-
-# build dataframe
-factor3_cluster_df <- data.frame(
-  sample_id = rownames(Xs),
-  projection = as.numeric(proj),
-  factor_score = Ys[, "Factor3"],
-  cluster = factor(km$cluster)
-)
-
-# merge metadata
-metadata <- samples_metadata(mofa_object.trained)
-factor3_cluster_df <- left_join(factor3_cluster_df, metadata, by = c("sample_id" = "patientID"))
-
-# --- 2. Add GSVA pathways (top 10 pos/neg)
-f3 <- hallmark_interpret[["Factor3"]]
-pathways <- c(head(f3$positive_pathways, 10), head(f3$negative_pathways, 10))
-gsva <- as.data.frame(t(ssgsea_hallmark[pathways, ]))
-gsva$sample_id <- rownames(gsva)
-df <- left_join(df, gsva, by = "sample_id")
-
-# --- 3. Summarize categorical metadata
-cat_vars <- c("tumor_tissue_site", "gender", "histological_type",
-              "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
-              "pathologic_stage")
-
-cat_summary <- lapply(cat_vars, function(v) {
-  if (!v %in% names(df)) return(NULL)
-  tab <- table(df$cluster, df[[v]], useNA = "ifany")
-
-  # get the actual cluster names dynamically
-  clust_names <- rownames(tab)
-
-  c1 <- paste0(colnames(tab), ": ", as.integer(tab[clust_names[1],]), 
-               " (", round(100*tab[clust_names[1],]/sum(tab[clust_names[1],]),1), "%)", collapse="; ")
-  c2 <- paste0(colnames(tab), ": ", as.integer(tab[clust_names[2],]), 
-               " (", round(100*tab[clust_names[2],]/sum(tab[clust_names[2],]),1), "%)", collapse="; ")
-
-  p <- NA
-  test <- NA
-  if (all(dim(tab)==c(2,2))) {
-    test <- "Fisher"
-    p <- tryCatch(fisher.test(tab)$p.value, error=function(e) NA)
-  } else if (nrow(tab)==2) {
-    test <- "Chi-square"
-    p <- tryCatch(chisq.test(tab)$p.value, error=function(e) NA)
-  }
-
-  data.frame(variable=v, cluster1=c1, cluster2=c2, test=test, p_value=p)
-}) %>% bind_rows()
-
-print(cat_summary)
-
-
-# Prepare data for plotting
-cat_plot_data <- factor3_cluster_df %>%
-  select(cluster, all_of(cat_vars)) %>%
-  pivot_longer(cols = -cluster, names_to = "variable", values_to = "value") %>%
-  group_by(cluster, variable, value) %>%
-  summarise(n = n(), .groups = "drop") %>%
-  group_by(variable, cluster) %>%
-  mutate(freq = n / sum(n))
-
-# Create one figure per variable
-plots <- lapply(unique(cat_plot_data$variable), function(v) {
-  ggplot(subset(cat_plot_data, variable == v),
-         aes(x = cluster, y = freq, fill = value)) +
-    geom_bar(stat = "identity", position = "fill") +
-    scale_y_continuous(labels = scales::percent_format()) +
-    labs(title = glue("Cluster composition by {v}"), y = "Proportion", x = "Cluster") +
-    theme_minimal() +
-    theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
-})
-
-# Display the first plot as example
-plots[[1]]
-
-# --- 4. Compare numeric pathways
-pathway_vars <- names(factor3_cluster_df)[sapply(df, is.numeric)]
-pathway_vars <- setdiff(pathway_vars, c("projection", "factor_score"))
-
-num_summary <- lapply(pathway_vars, function(p) {
-  vals1 <- df[[p]][df$cluster=="Cluster1"]
-  vals2 <- df[[p]][df$cluster=="Cluster2"]
-  mean_diff <- mean(vals1, na.rm=TRUE) - mean(vals2, na.rm=TRUE)
-  pval <- NA
-  if (var(vals1, na.rm=TRUE) !=0 & var(vals2, na.rm=TRUE)!=0) {
-    pval <- tryCatch(t.test(vals1, vals2)$p.value, error=function(e) NA)
-  }
-  data.frame(pathway=p, mean_diff=mean_diff, p_value=pval)
-}) %>% bind_rows() %>% arrange(p_value)
-
-print(head(num_summary, 20))  # top 20 differences
-
-
-# --- 6. Plot clusters
-ggplot(factor3_cluster_df, aes(x=factor_score, y=projection, color=cluster)) +
-  geom_point(alpha=0.7) +
-  theme_minimal() +
-  labs(title="Factor3 clusters", x="MOFA Factor3", y="Projection")
-
-
-
-
-```
-
-
-# factor 3 Surv cluster
+# Survival
 ```{R}
 # surv
 
@@ -917,67 +594,253 @@ cluster_surv_cens <- coxph(Surv(time, event) ~ cluster + age + gender + stage +
 
 
 
-# Factor scores and clin vars
+# Ovar R2: Factor and clin vars
 
 ```{r}
-# Ensure metadata merged correctly
-factors_metadata_df <- get_factors(mofa_object.trained, factors = "all", as.data.frame = TRUE) %>%
-  inner_join(metadata_df, by = c("sample" = "patientID"))
+# For both OV and COLON
+clin_vars <- c(
+  # Batch proxy
+  "patient.tissue_source_site",
+  
+  # Demographics  
+  "patient.age_at_initial_pathologic_diagnosis",  # numeric - will use lm directly
+  "patient.ethnicity",
+  
+  # Survival/outcome
+  "patient.vital_status",
+  "patient.days_to_death",                         # numeric
+  "patient.days_to_last_followup",                 # numeric
+  "patient.person_neoplasm_cancer_status",         # with/without tumor at followup
+  "patient.primary_therapy_outcome_success",       # treatment response
+  
+  # Pathology
+  "patient.neoplasm_histologic_grade",
+  "patient.residual_tumor",                        # key for OV: R0/R1/R2 debulking
+  "patient.lymphatic_invasion",
+  "patient.anatomic_neoplasm_subdivision",
+  
+  # Performance
+  "karnofsky_performance_score",                   # numeric
+  "patient.eastern_cancer_oncology_group"
+)
 
-factors_metadata_df <- factors_metadata_df %>%
-  select(sample, factor, value, all_of(clin_vars)) %>%
+factors_metadata_ov <- get_factors(mofa_object.ov, factors = "all", as.data.frame = TRUE) %>%
+  inner_join(metadata_ov, by = c("sample" = "patientID")) %>%
+  select(sample, factor, value, any_of(clin_vars)) %>%
   pivot_wider(names_from = factor, values_from = value)
 
-# selecting some clinical metadata vars
-clin_vars <- c("tumor_tissue_site", "gender", "histological_type",
-               "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
-               "pathologic_stage")
-
-# empty df for results
-r2_df_mofa_factors <- data.frame()
-
+r2_ov <- data.frame()
 for (var in clin_vars) {
-  for (f in grep("^Factor", names(factors_metadata_df), value = TRUE)) {
-    y <- as.numeric(factors_metadata_df[[f]])
-    x <- factors_metadata_df[[var]]
-
-    if (all(is.na(y)) || length(unique(na.omit(x))) < 2) next
-
-    model <- lm(y ~ x)
-    r2 <- summary(model)$r.squared
-
-    r2_df_mofa_factors <- rbind(
-      r2_df_mofa_factors,
-      data.frame(Factor = f, Clinical_Variable = var, R2 = r2)
-    )
+  if (!var %in% colnames(factors_metadata_ov)) next
+  for (f in grep("^Factor", names(factors_metadata_ov), value = TRUE)) {
+    y <- as.numeric(factors_metadata_ov[[f]])
+    x <- factors_metadata_ov[[var]]
+    if (!is.numeric(x)) {
+      x_num <- suppressWarnings(as.numeric(x))
+      if (mean(is.na(x_num)) < 0.5) x <- x_num
+    }
+    complete_idx <- !is.na(y) & !is.na(x)
+    if (sum(complete_idx) < 10 || length(unique(x[complete_idx])) < 2) next
+    r2 <- summary(lm(y ~ x))$r.squared
+    r2_ov <- rbind(r2_ov, data.frame(Factor = f, Clinical_Variable = var, R2 = r2))
   }
 }
 
-# Plot
-
-ggplot(r2_df_mofa_factors, aes(
+ggplot(r2_ov, aes(
   x = as.numeric(gsub("Factor", "", Factor)),
-  y = R2,
-  color = Clinical_Variable,
-  group = Clinical_Variable
+  y = R2, color = Clinical_Variable, group = Clinical_Variable
 )) +
-  geom_line() +
+  geom_line(linewidth = 0.7) +
   geom_point(size = 1.2) +
-  theme_bw() +
-  scale_x_continuous(breaks = seq(0, max(as.numeric(gsub("Factor", "", r2_df_mofa_weights$Factor))), 2)) +
-  labs(
-    title = "Variance in MOFA Factors Explained by Clinical Variables",
-    x = "MOFA Factor",
-    y = expression(R^2 ~ " (from linear model)")
-  )
+  theme_bw(base_size = 11) +
+  scale_x_continuous(breaks = 1:max(as.numeric(gsub("Factor", "", r2_ov$Factor)))) +
+  scale_color_manual(values = c(
+    "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
+    "#A65628", "#F781BF", "#009", "#66C2A5", "#999999",
+    "#8DA0CB", "#E78AC3", "#A6D854"
+  )) +
+  labs(title = "MOFA Factors vs Clinical Variables (OV)",
+       x = "MOFA Factor", y = expression(R^2),
+       color = "Clinical Variable") +
+  theme(legend.position = "bottom", legend.text = element_text(size = 7),
+        legend.title = element_blank())
+```
 
+
+# Colon R2: Factor and clin vars
+
+```{r}
+
+factors_metadata_colon <- get_factors(mofa_object.colon, factors = "all", as.data.frame = TRUE) %>%
+  inner_join(coad_metadata, by = c("sample" = "patientID")) %>%
+  select(sample, factor, value, any_of(clin_vars)) %>%
+  pivot_wider(names_from = factor, values_from = value)
+
+r2_colon <- data.frame()
+for (var in clin_vars) {
+  if (!var %in% colnames(factors_metadata_colon)) next
+  for (f in grep("^Factor", names(factors_metadata_colon), value = TRUE)) {
+    y <- as.numeric(factors_metadata_colon[[f]])
+    x <- factors_metadata_colon[[var]]
+    if (!is.numeric(x)) {
+      x_num <- suppressWarnings(as.numeric(x))
+      if (mean(is.na(x_num)) < 0.5) x <- x_num
+    }
+    complete_idx <- !is.na(y) & !is.na(x)
+    if (sum(complete_idx) < 10 || length(unique(x[complete_idx])) < 2) next
+    r2 <- summary(lm(y ~ x))$r.squared
+    r2_colon <- rbind(r2_colon, data.frame(Factor = f, Clinical_Variable = var, R2 = r2))
+  }
+}
+
+ggplot(r2_colon, aes(
+  x = as.numeric(gsub("Factor", "", Factor)),
+  y = R2, color = Clinical_Variable, group = Clinical_Variable
+)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.2) +
+  theme_bw(base_size = 11) +
+  scale_x_continuous(breaks = 1:max(as.numeric(gsub("Factor", "", r2_ov$Factor)))) +
+  scale_color_manual(values = c(
+    "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
+    "#A65628", "#F781BF", "#999999", "#66C2A5", "#00008b",
+    "#8DA0CB", "#E78AC3", "#A6D854"
+  )) +
+  labs(title = "MOFA Factors vs Clinical Variables (colon)",
+       x = "MOFA Factor", y = expression(R^2),
+       color = "Clinical Variable") +
+  theme(legend.position = "bottom", legend.text = element_text(size = 7),
+         legend.title = element_blank())
+```
+
+
+```{r}
+
+```
+
+
+# Ovar TopEmbedding
+
+```{r}
+# ============================================================
+# Top embedding dimensions per MOFA factor - OV
+# ============================================================
+
+embed_weights_ov <- get_weights(mofa_object.ov,
+                                 views = "slide_assay",
+                                 factors = "all",
+                                 as.data.frame = TRUE)
+
+# Top 20 embedding dims per factor by absolute weight
+top_embed_ov <- embed_weights_ov %>%
+  group_by(factor) %>%
+  mutate(abs_weight = abs(value)) %>%
+  arrange(factor, desc(abs_weight)) %>%
+  slice_head(n = 20) %>%
+  ungroup()
+
+# Heatmap: factors x top embedding dims
+# Use top 10 per factor for cleaner viz
+top10_dims_ov <- top_embed_ov %>%
+  group_by(factor) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  pull(feature) %>%
+  unique()
+
+embed_weights_wide_ov <- embed_weights_ov %>%
+  filter(feature %in% top10_dims_ov) %>%
+  pivot_wider(names_from = feature, values_from = value, values_fill = 0) %>%
+  column_to_rownames("factor")
+
+
+embd_mat_ov <- embed_weights_wide_ov[, sapply(embed_weights_wide_ov, is.numeric)]
+
+pheatmap(
+  as.matrix(embd_mat_ov),
+  scale = "none",
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  main = "MOFA weights: Factors x Embedding dimensions (OV)",
+  fontsize_row = 9,
+  fontsize_col = 7
+)
+
+# Print top 5 embedding dims per factor as a table
+top5_embed_ov <- embed_weights_ov %>%
+  group_by(factor) %>%
+  mutate(abs_weight = abs(value)) %>%
+  arrange(factor, desc(abs_weight)) %>%
+  slice_head(n = 5) %>%
+  ungroup() %>%
+  select(factor, feature, value, abs_weight)
+
+print(top5_embed_ov)
 ```
 
 
 
 
+```{r}
+# ============================================================
+# Top embedding dimensions per MOFA factor - COLON
+# ============================================================
+
+embed_weights_colon <- get_weights(mofa_object.colon,
+                                    views = "slide_assay",
+                                    factors = "all",
+                                    as.data.frame = TRUE)
+
+top_embed_colon <- embed_weights_colon %>%
+  group_by(factor) %>%
+  mutate(abs_weight = abs(value)) %>%
+  arrange(factor, desc(abs_weight)) %>%
+  slice_head(n = 20) %>%
+  ungroup()
+
+top10_dims_colon <- top_embed_colon %>%
+  group_by(factor) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  pull(feature) %>%
+  unique()
+
+embed_weights_wide_colon <- embed_weights_colon %>%
+  filter(feature %in% top10_dims_colon) %>%
+  pivot_wider(names_from = feature, values_from = value, values_fill = 0) %>%
+  column_to_rownames("factor")
+
+embd_mat_colon <- embed_weights_wide_colon[, sapply(embed_weights_wide_colon, is.numeric)]
 
 
+pheatmap(
+  as.matrix(embd_mat_colon),
+  scale = "none",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  main = "MOFA weights: Factors x Embedding dimensions (COLON)",
+  fontsize_row = 9,
+  fontsize_col = 7
+)
+
+top5_embed_colon <- embed_weights_colon %>%
+  group_by(factor) %>%
+  mutate(abs_weight = abs(value)) %>%
+  arrange(factor, desc(abs_weight)) %>%
+  slice_head(n = 5) %>%
+  ungroup() %>%
+  select(factor, feature, value, abs_weight)
+
+print(top5_embed_colon)
+```
+
+```
+Embedding dim 342, 107, 23  →  high weight in Factor6
+Factor6 RNA weights         →  GSEA enriched: HALLMARK_EMT (NES=2.1, padj<0.001)
+Conclusion: Those specific embedding dims likely encode EMT morphology
+```
 
 
 
@@ -1785,3 +1648,482 @@ cox_formula <- as.formula(paste0("Surv(time, event) ~ ", paste(mv_vars, collapse
 cox_mv <- coxph(cox_formula, data = meta2_std)
 summary(cox_mv)
 ```
+
+
+
+
+
+# Misc CODE
+
+
+# PCA of Image Embeddings to Interpret MOFA Factors (Ovarian Cancer)
+
+```{r}
+# For OV
+data_ov <- get_data(mofa_object.ov)                 # list of matrices, one per view
+embed_ov_raw <- data_ov[["slide_assay"]]             # features x samples
+embed_mat <- embed_ov_raw[["group1"]]   # features x samples
+embed_ov <- t(embed_mat)                          # samples x features
+
+
+# Reshape factors
+factors_wide <- factors_ov %>%
+  pivot_wider(id_cols = sample, names_from = factor, values_from = value)
+factors_mat <- as.matrix(factors_wide[, -1])
+rownames(factors_mat) <- factors_wide$sample
+
+# Align
+common <- intersect(rownames(factors_mat), rownames(embed_ov))
+factors_ov_aligned <- factors_mat[common, , drop = FALSE]
+embed_ov_aligned <- embed_ov[common, , drop = FALSE]
+```
+
+
+# PCA
+```{r}
+library(reshape2)
+# 1. Perform PCA on the scaled embeddings
+pca_ov <- prcomp(embed_ov_aligned, center = TRUE, scale. = TRUE)
+
+# 2. Variance explained plot (first 10 PCs)
+var_exp <- data.frame(
+  PC = factor(paste0("PC", 1:10), levels = paste0("PC", 1:10)),
+  Variance = summary(pca_ov)$importance[2, 1:10] * 100
+)
+ggplot(var_exp, aes(x = PC, y = Variance)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Variance Explained by Principal Components (OV)",
+       x = "Principal Component", y = "Variance Explained (%)") +
+  theme_minimal(base_size = 12)
+
+# 3. Extract PC scores (first 10 components for correlation)
+k <- 10
+pca_scores <- as.data.frame(pca_ov$x[, 1:k])
+colnames(pca_scores) <- paste0("PC", 1:k)
+pca_scores$sample <- rownames(pca_scores)
+
+# 4. Prepare factor scores as data frame with sample column
+factors_df <- as.data.frame(factors_ov_aligned)
+factors_df$sample <- rownames(factors_df)
+
+# 5. Merge PC scores with factor scores
+merged_df <- merge(pca_scores, factors_df, by = "sample")
+
+# 6. Compute correlation between PCs and MOFA factors
+pc_cols <- paste0("PC", 1:k)
+factor_cols <- colnames(factors_ov_aligned)
+cor_matrix <- cor(merged_df[, pc_cols], merged_df[, factor_cols], 
+                  use = "pairwise.complete.obs")
+
+# 7. Heatmap of correlations
+cor_melt <- melt(cor_matrix, varnames = c("PC", "Factor"), value.name = "Correlation")
+ggplot(cor_melt, aes(x = Factor, y = PC, fill = Correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1)) +
+  labs(title = "Correlation between MOFA Factors and Image Embedding PCs (OV)",
+       x = "MOFA Factor", y = "Principal Component") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 8. For a factor of interest (e.g., Factor1), find the most correlated PC
+factor_of_interest <- "Factor1"
+best_pc <- names(which.max(abs(cor_matrix[, factor_of_interest])))
+cat("PC most correlated with", factor_of_interest, ":", best_pc, "\n")
+
+# 9. Examine the loadings of that PC to understand which embedding features drive it
+loadings_best <- pca_ov$rotation[, best_pc]
+top_loadings <- sort(abs(loadings_best), decreasing = TRUE)[1:20]
+top_features <- names(top_loadings)
+top_loadings_df <- data.frame(
+  Embedding_Feature = top_features,
+  Loading = loadings_best[top_features],
+  Abs_Loading = abs(loadings_best[top_features])
+) %>% arrange(desc(Abs_Loading))
+print(head(top_loadings_df, 10))
+
+# 10. (Optional) Compare with top MOFA weights for the same factor
+#     (assuming you have embedding_weight_table from earlier)
+# top_weights_factor1 <- subset(embedding_weight_table, Factor == "Factor1")[1:20, ]
+
+# 11. Scatter plot of PC1 vs PC2 colored by the factor score
+#     Add clinical metadata from MOFA for extra annotation
+metadata_ov <- samples_metadata(mofa_object.ov)
+plot_df <- merged_df %>%
+  left_join(metadata_ov, by = "sample")
+
+ggplot(plot_df, aes(x = PC1, y = PC2, color = Factor1)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "PCA of Image Embeddings colored by MOFA Factor1 (OV)",
+       x = paste0("PC1 (", round(summary(pca_ov)$importance[2,1]*100, 1), "%)"),
+       y = paste0("PC2 (", round(summary(pca_ov)$importance[2,2]*100, 1), "%)"),
+       color = "Factor1 score") +
+  theme_minimal(base_size = 12)
+```
+
+
+
+
+# Batch effect
+
+```{r}
+# Get embedding weights from MOFA
+embed_weights_ov <- get_weights(mofa_object.ov, 
+                                 views = "slide_assay", 
+                                 as.data.frame = TRUE)
+
+# For each factor, what are the top embedding dimensions?
+top_embed_weights <- embed_weights_ov %>%
+  group_by(factor) %>%
+  mutate(abs_weight = abs(value)) %>%
+  arrange(factor, desc(abs_weight)) %>%
+  slice_head(n = 20)
+
+
+
+# Get weights for RNA view for the same factors
+rna_weights_ov <- get_weights(mofa_object.ov,
+                               views = "OV_RNASeq2GeneNorm-20160128",
+                               as.data.frame = TRUE)
+
+# Top genes per factor
+top_rna_weights <- rna_weights_ov %>%
+  group_by(factor) %>%
+  mutate(abs_weight = abs(value)) %>%
+  arrange(factor, desc(abs_weight)) %>%
+  slice_head(n = 50)
+
+
+
+```
+
+
+
+
+
+
+# PCA interpretation
+
+### Matrices
+
+```{r}
+#==============================================================
+# 1. Get factor scores
+#==============================================================
+factor_scores <- get_factors(mofa_object.trained, factors = "all", as.data.frame = FALSE)[[1]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("patient_id")
+
+#==============================================================
+# 2. Load embeddings (last layer only)
+#==============================================================
+devtools::load_all()  # contains getEmbeddingLayer()
+
+participant_ids <- gsub(".csv$", "", basename(fnames)) %>% 
+  strsplit(., "-") %>% 
+  sapply(\(x) paste(x[1:3], collapse = "-"))
+
+structure_last <- getEmbeddingLayer(fnames, participant_ids, layer = "last_layer_embed")
+
+#==============================================================
+# 3. Align patients between MOFA factors and embeddings
+#==============================================================
+shared_ids <- intersect(rownames(structure_last), factor_scores$patient_id)
+
+embedding_matched <- structure_last[shared_ids, , drop = FALSE]
+factor_scores_matched <- factor_scores[factor_scores$patient_id %in% shared_ids, ]
+rownames(factor_scores_matched) <- factor_scores_matched$patient_id
+factor_scores_matched <- factor_scores_matched[shared_ids, , drop = FALSE]
+
+#==============================================================
+# 4. Table 1: Correlation (factors × embedding dims)
+#==============================================================
+cor_mat <- cor(
+  factor_scores_matched[, -1],
+  embedding_matched,
+  use = "pairwise.complete.obs"
+)
+
+embedding_corr_table <- as.data.frame(cor_mat) %>%
+  tibble::rownames_to_column("Factor") %>%
+  tidyr::pivot_longer(-Factor,
+                      names_to = "Embedding_Dimension",
+                      values_to = "Correlation") %>%
+  dplyr::mutate(Abs_Corr = abs(Correlation)) %>%
+  dplyr::arrange(Factor, desc(Abs_Corr))
+
+#==============================================================
+# 5. Table 2: Top weighted embeddings from MOFA
+#==============================================================
+embedding_weights <- get_weights(mofa_object.trained, view = "Embedding_last", as.data.frame = FALSE)[[1]]
+
+embedding_weight_table <- lapply(seq_len(ncol(embedding_weights)), function(f) {
+  tibble::tibble(
+    Factor = colnames(embedding_weights)[f],
+    Embedding_Dimension = rownames(embedding_weights),
+    Weight = embedding_weights[, f],
+    Abs_Weight = abs(embedding_weights[, f])
+  ) %>%
+    dplyr::arrange(desc(Abs_Weight)) %>%
+    dplyr::slice_head(n = 20)  # top 20 per factor
+}) %>%
+  dplyr::bind_rows()
+
+#==============================================================
+# Outputs
+#==============================================================
+head(embedding_corr_table)
+head(embedding_weight_table)
+```
+
+
+
+
+# Exploring Embeddings
+
+```{r}
+# PCA on embeddings
+pca_res <- prcomp(embedding_matched, scale. = TRUE)
+
+# Examine variance explained
+summary(pca_res)
+
+# Get sample scores (N x components)
+pca_scores <- as.data.frame(pca_res$x)
+head(pca_scores)
+
+# Correlate PCA components with MOFA factor scores
+pca_factor_cor <- cor(pca_scores, factor_scores_matched[, -1], use = "pairwise.complete.obs")
+
+
+# visualize first two PCs
+ggplot(pca_scores, aes(PC1, PC2)) +
+  geom_point(color = "gray40") +
+  theme_minimal() +
+  labs(title = "PCA of Image Embeddings",
+       x = paste0("PC1 (", round(summary(pca_res)$importance[2,1]*100, 1), "% var)"),
+       y = paste0("PC2 (", round(summary(pca_res)$importance[2,2]*100, 1), "% var)"))
+
+ggplot(pca_scores %>% cbind(df), aes(PC1, PC2, color = cluster)) + geom_point()
+
+
+```
+
+
+
+```{r}
+# Clinical variables to test
+clin_vars <- c("tumor_tissue_site", "gender", "histological_type",
+              "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
+              "pathologic_stage")
+
+# Initialize list to store R² results
+r2_results <- list()
+
+for (v in clin_vars) {
+  if (!v %in% names(df)) next
+  r2_vec <- sapply(names(pca_scores), function(pc) {
+    f <- as.formula(paste(pc, "~", v))
+    mod <- lm(f, data = cbind(df, pca_scores))
+    summary(mod)$r.squared
+  })
+  r2_results[[v]] <- data.frame(
+    PC = names(pca_scores),
+    R2 = r2_vec,
+    variable = v
+  )
+}
+
+r2_df <- do.call(rbind, r2_results)  %>%
+  dplyr::filter(as.numeric(gsub("PC", "", PC)) <= 60)
+
+
+# Plot
+r2_df$PC <- as.numeric(gsub("PC", "", r2_df$PC))
+
+ggplot(r2_df, aes(x = PC, y = R2, color = variable, group = variable)) +
+  geom_line() +
+  geom_point(size = 1.2) +
+  scale_x_continuous(
+    breaks = seq(0, 60, 10),
+    labels = seq(0, 60, 10),
+    expand = c(0, 0)
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 0, vjust = 0.5)
+  ) +
+  labs(
+    title = "Variance in PCA Components Explained by Clinical Variables",
+    x = "PC",
+    y = expression(R^2 ~ " (from linear model)")
+  )
+
+```
+
+
+
+
+# Projection of embeddings
+
+```{r}
+# matrices
+X <- as.matrix(embedding_matched)                 # N x D
+Y <- as.matrix(factor_scores_matched[ , -1 ])     # N x F
+
+# center/scale X and Y as needed
+Xs <- scale(X)          # mean 0, sd 1
+Ys <- scale(Y)
+
+W <- as.matrix(embedding_weights)    # D x F (rownames = embedding dims, colnames = Factor names)
+
+# choose factor j (or loop)
+j <- "Factor3"
+w_j <- W[, j]                        # length D
+
+# project each sample into that MOFA-derived direction
+proj_wj <- Xs %*% w_j                # N x 1
+
+# compare to factor scores
+cor(proj_wj, Ys[, j])
+plot(
+  Ys[, j], proj_wj,
+  xlab = paste("MOFA factor", j, "score"),
+  ylab = "Projection on embedding weights",
+  main = paste("Embedding–Factor association:", j),
+  pch = 16, col = "gray40"
+)
+abline(lm(proj_wj ~ Ys[, j]), col = "red", lwd = 2)
+
+
+heatmap(embedding_weights, scale = "row",
+        xlab = "MOFA factors", ylab = "Embedding dimensions",
+        main = "Embedding–Factor weight structure")
+
+
+
+```
+
+
+# Analyse clusters of embeddings projection Factor 3
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(glue)
+
+# --- 1. Cluster assignment and merge metadata
+proj <- Xs %*% W[, "Factor3"]
+
+# kmeans ** note: could use other clustering methods
+
+# run k-means on the projection or embeddings
+km <- kmeans(proj, centers = 2, nstart = 20)
+
+# build dataframe
+factor3_cluster_df <- data.frame(
+  sample_id = rownames(Xs),
+  projection = as.numeric(proj),
+  factor_score = Ys[, "Factor3"],
+  cluster = factor(km$cluster)
+)
+
+# merge metadata
+metadata <- samples_metadata(mofa_object.trained)
+factor3_cluster_df <- left_join(factor3_cluster_df, metadata, by = c("sample_id" = "patientID"))
+
+# --- 2. Add GSVA pathways (top 10 pos/neg)
+f3 <- hallmark_interpret[["Factor3"]]
+pathways <- c(head(f3$positive_pathways, 10), head(f3$negative_pathways, 10))
+gsva <- as.data.frame(t(ssgsea_hallmark[pathways, ]))
+gsva$sample_id <- rownames(gsva)
+df <- left_join(df, gsva, by = "sample_id")
+
+# --- 3. Summarize categorical metadata
+cat_vars <- c("tumor_tissue_site", "gender", "histological_type",
+              "patient.vital_status", "patient.anatomic_neoplasm_subdivision",
+              "pathologic_stage")
+
+cat_summary <- lapply(cat_vars, function(v) {
+  if (!v %in% names(df)) return(NULL)
+  tab <- table(df$cluster, df[[v]], useNA = "ifany")
+
+  # get the actual cluster names dynamically
+  clust_names <- rownames(tab)
+
+  c1 <- paste0(colnames(tab), ": ", as.integer(tab[clust_names[1],]), 
+               " (", round(100*tab[clust_names[1],]/sum(tab[clust_names[1],]),1), "%)", collapse="; ")
+  c2 <- paste0(colnames(tab), ": ", as.integer(tab[clust_names[2],]), 
+               " (", round(100*tab[clust_names[2],]/sum(tab[clust_names[2],]),1), "%)", collapse="; ")
+
+  p <- NA
+  test <- NA
+  if (all(dim(tab)==c(2,2))) {
+    test <- "Fisher"
+    p <- tryCatch(fisher.test(tab)$p.value, error=function(e) NA)
+  } else if (nrow(tab)==2) {
+    test <- "Chi-square"
+    p <- tryCatch(chisq.test(tab)$p.value, error=function(e) NA)
+  }
+
+  data.frame(variable=v, cluster1=c1, cluster2=c2, test=test, p_value=p)
+}) %>% bind_rows()
+
+print(cat_summary)
+
+
+# Prepare data for plotting
+cat_plot_data <- factor3_cluster_df %>%
+  select(cluster, all_of(cat_vars)) %>%
+  pivot_longer(cols = -cluster, names_to = "variable", values_to = "value") %>%
+  group_by(cluster, variable, value) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(variable, cluster) %>%
+  mutate(freq = n / sum(n))
+
+# Create one figure per variable
+plots <- lapply(unique(cat_plot_data$variable), function(v) {
+  ggplot(subset(cat_plot_data, variable == v),
+         aes(x = cluster, y = freq, fill = value)) +
+    geom_bar(stat = "identity", position = "fill") +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(title = glue("Cluster composition by {v}"), y = "Proportion", x = "Cluster") +
+    theme_minimal() +
+    theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+})
+
+# Display the first plot as example
+plots[[1]]
+
+# --- 4. Compare numeric pathways
+pathway_vars <- names(factor3_cluster_df)[sapply(df, is.numeric)]
+pathway_vars <- setdiff(pathway_vars, c("projection", "factor_score"))
+
+num_summary <- lapply(pathway_vars, function(p) {
+  vals1 <- df[[p]][df$cluster=="Cluster1"]
+  vals2 <- df[[p]][df$cluster=="Cluster2"]
+  mean_diff <- mean(vals1, na.rm=TRUE) - mean(vals2, na.rm=TRUE)
+  pval <- NA
+  if (var(vals1, na.rm=TRUE) !=0 & var(vals2, na.rm=TRUE)!=0) {
+    pval <- tryCatch(t.test(vals1, vals2)$p.value, error=function(e) NA)
+  }
+  data.frame(pathway=p, mean_diff=mean_diff, p_value=pval)
+}) %>% bind_rows() %>% arrange(p_value)
+
+print(head(num_summary, 20))  # top 20 differences
+
+
+# --- 6. Plot clusters
+ggplot(factor3_cluster_df, aes(x=factor_score, y=projection, color=cluster)) +
+  geom_point(alpha=0.7) +
+  theme_minimal() +
+  labs(title="Factor3 clusters", x="MOFA Factor3", y="Projection")
+
+
+
+
+```
+
