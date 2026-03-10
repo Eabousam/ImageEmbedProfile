@@ -855,77 +855,6 @@ Conclusion: Those specific embedding dims likely encode EMT morphology
 
 
 
-```{r, GSEA, include=TRUE, echo=TRUE}
-
-# get Hallmark gene sets
-#50 curated gene sets representing broad, well-defined biological processes (e.g., MYC targets, E2F targets, KRAS signaling, apoptosis)
-pathways_hallmark <- msigdbr(species = "Homo sapiens", collection = "H") %>%
-  split(x = .$gene_symbol, f = .$gs_name)
-
-# get c2 gene sets
-# Gene sets representing signatures of oncogene activation or inactivation (e.g., KRAS, MYC, E2F, PTEN loss).
-pathways_c6 <- msigdbr(species = "Homo sapiens", collection = "C6") %>%
-  split(x = .$gene_symbol, f = .$gs_name)
-
-# get c2 gene sets
-#Pathway databases and expert-curated gene sets, subdivided into:
-##CGP (chemical/genetic perturbations) → genes responsive to drugs or perturbations.
-##CP (canonical pathways) → pathways from KEGG, Reactome, BioCarta.
-pathways_c2 <- msigdbr(species = "Homo sapiens", collection = "C2") %>%
-  split(x = .$gene_symbol, f = .$gs_name)
-
-
-
-
-```
-
-## Run FGSEA
-
-```{r}
-
-## Run FGSEA for all factors
-
-#gene set enrichment analysis (GSEA) to identify biological pathways and programs associated with the latent factors
-# Extract weights for Factor 1 in RNASeq
-# we extracted the feature weights for the top contributing genes in the rnaseq view, which represent the genes most associated with factor 1
-
-all_weights <- get_weights(mofa_object.trained, 
-                           views = "RNASeq", 
-                           factors = "all", 
-                           as.data.frame = TRUE)
-
-# For each factor, run GSEA to understand biological meaning
-factor_interpretation <- list()
-
-for(factor_id in unique(all_weights$factor)) {
-  # factor_id already has the form "Factor1", "Factor2", etc.
-  
-  # Get weights for this factor
-  factor_weights <- all_weights[all_weights$factor == factor_id, ]
-  
-  # Create ranked list
-  ranks <- factor_weights$value
-  names(ranks) <- factor_weights$feature
-  ranks <- sort(ranks, decreasing = TRUE)
-  
-  # Run GSEA on multiple gene set collections
-  hallmark_res <- fgsea(pathways_hallmark, ranks, minSize = 15, maxSize = 500)
-  c2_res      <- fgsea(pathways_c2, ranks, minSize = 15, maxSize = 500)
-  c6_res      <- fgsea(pathways_c6, ranks, minSize = 15, maxSize = 500)
-  
-  # Store top pathways for interpretation
-  factor_interpretation[[factor_id]] <- list(
-    hallmark_top = hallmark_res[order(hallmark_res$pval), ][1:20, ],
-    c2_top       = c2_res[order(c2_res$pval), ][1:20, ],
-    c6_top       = c6_res[order(c6_res$pval), ][1:20, ]
-  )
-}
-
-
-# Check any of the gene sets with factors
-factor_interpretation$Factor3$c2_top
-
-```
 
 **Explanation of GSEA output (fgsea):**
 
@@ -950,6 +879,283 @@ factor_interpretation$Factor3$c2_top
     -   MYC is a master regulator of proliferation, metabolism, and growth (Dang, Cell, 2012).
 
 -   epithelial–mesenchymal transition (EMT), inflammatory response, interferon gamma response, and allograft rejection. This points to activation of immune and stromal programs.
+
+
+```{r, GSEA, include=TRUE, echo=TRUE}
+
+# get Hallmark gene sets
+#50 curated gene sets representing broad, well-defined biological processes (e.g., MYC targets, E2F targets, KRAS signaling, apoptosis)
+pathways_hallmark <- msigdbr(species = "Homo sapiens", collection = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# get c2 gene sets
+# Gene sets representing signatures of oncogene activation or inactivation (e.g., KRAS, MYC, E2F, PTEN loss).
+pathways_c6 <- msigdbr(species = "Homo sapiens", collection = "C6") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# get c2 gene sets
+#Pathway databases and expert-curated gene sets, subdivided into:
+##CGP (chemical/genetic perturbations) → genes responsive to drugs or perturbations.
+##CP (canonical pathways) → pathways from KEGG, Reactome, BioCarta.
+pathways_c2 <- msigdbr(species = "Homo sapiens", collection = "C2") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+
+
+
+```
+
+## OV: FGSEA
+
+```{r}
+
+## Run FGSEA for all factors
+
+#gene set enrichment analysis (GSEA) to identify biological pathways and programs associated with the latent factors
+# Extract weights for Factor 1 in RNASeq
+# we extracted the feature weights for the top contributing genes in the rnaseq view, which represent the genes most associated with factor 1
+
+# ============================================================
+# OV: FGSEA on RNA weights per factor
+# ============================================================
+
+all_weights_ov <- get_weights(mofa_object.ov, 
+                               views = "OV_RNASeq2GeneNorm-20160128", 
+                               factors = "all", 
+                               as.data.frame = TRUE)
+
+factor_gsea_ov <- list()
+
+for (factor_id in unique(all_weights_ov$factor)) {
+  
+  factor_weights <- all_weights_ov[all_weights_ov$factor == factor_id, ]
+  
+  ranks <- factor_weights$value
+  names(ranks) <- factor_weights$feature
+  ranks <- sort(ranks, decreasing = TRUE)
+  
+  hallmark_res <- fgsea(pathways_hallmark, ranks, minSize = 15, maxSize = 500)
+  c2_res       <- fgsea(pathways_c2,       ranks, minSize = 15, maxSize = 500)
+  c6_res       <- fgsea(pathways_c6,       ranks, minSize = 15, maxSize = 500)
+  
+  factor_gsea_ov[[factor_id]] <- list(
+    hallmark_top = hallmark_res[order(hallmark_res$pval), ][1:20, ],
+    c2_top       = c2_res[order(c2_res$pval),             ][1:20, ],
+    c6_top       = c6_res[order(c6_res$pval),             ][1:20, ]
+  )
+}
+
+# Check
+factor_gsea_ov$Factor6$c6_top
+
+```
+
+
+### Interpret
+```{r}
+# ============================================================
+# OV: FGSEA Summary Table
+# ============================================================
+
+fgsea_summary_ov <- lapply(names(factor_gsea_ov), function(fid) {
+  
+  hallmark <- factor_gsea_ov[[fid]]$hallmark_top %>%
+    filter(!is.na(pathway)) %>%
+    arrange(pval) %>%
+    slice_head(n = 5) %>%
+    mutate(label = paste0(gsub("HALLMARK_", "", pathway), 
+                          " (NES=", round(NES, 2), 
+                          ", p=", signif(pval, 2), ")")) %>%
+    pull(label) %>%
+    paste(collapse = "<br>")
+  
+  c2 <- factor_gsea_ov[[fid]]$c2_top %>%
+    filter(!is.na(pathway)) %>%
+    arrange(pval) %>%
+    slice_head(n = 3) %>%
+    mutate(label = paste0(pathway,
+                          " (NES=", round(NES, 2),
+                          ", p=", signif(pval, 2), ")")) %>%
+    pull(label) %>%
+    paste(collapse = "<br>")
+  
+  c6 <- factor_gsea_ov[[fid]]$c6_top %>%
+    filter(!is.na(pathway)) %>%
+    arrange(pval) %>%
+    slice_head(n = 3) %>%
+    mutate(label = paste0(pathway,
+                          " (NES=", round(NES, 2),
+                          ", p=", signif(pval, 2), ")")) %>%
+    pull(label) %>%
+    paste(collapse = "<br>")
+  
+  # Top embedding dims for this factor
+  top_embeds <- top_embed_ov %>%
+    filter(factor == fid) %>%
+    slice_head(n = 5) %>%
+    mutate(label = paste0(feature, " (w=", round(abs_weight, 3), ")")) %>%
+    pull(label) %>%
+    paste(collapse = "<br>")
+  
+  data.frame(
+    Factor          = fid,
+    Top_Embeddings  = top_embeds,
+    Hallmark_GSEA   = hallmark,
+    C2_GSEA         = c2,
+    C6_GSEA         = c6,
+    stringsAsFactors = FALSE
+  )
+}) %>% bind_rows()
+
+# ============================================================
+# Render as nice HTML table
+# ============================================================
+library(kableExtra)
+
+fgsea_summary_ov %>%
+  kable(
+    format  = "html",
+    escape  = FALSE,
+    col.names = c("Factor", 
+                  "Top Embedding Dims", 
+                  "Hallmark Pathways",
+                  "C2 Pathways", 
+                  "C6 Pathways"),
+    caption = "<strong>OV: FGSEA Enriched Pathways per MOFA Factor and Associated Embedding Dimensions</strong>"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width  = TRUE,
+    font_size   = 12
+  ) %>%
+  column_spec(1, bold = TRUE, width = "70px",  background = "#1a5276", color = "white") %>%
+  column_spec(2, width = "150px", background = "#f0f3f4") %>%
+  column_spec(3, width = "250px") %>%
+  column_spec(4, width = "220px") %>%
+  column_spec(5, width = "220px") %>%
+  row_spec(0, background = "#2e86c1", color = "white", bold = TRUE) %>%
+  scroll_box(width = "100%", height = "700px")
+```
+
+
+# CO: FGSEA
+```{r}
+# ============================================================
+# COLON: FGSEA on RNA weights per factor
+# ============================================================
+
+all_weights_colon <- get_weights(mofa_object.colon, 
+                                  views = "COAD_RNASeq2GeneNorm-20160128",  # update view name if different
+                                  factors = "all", 
+                                  as.data.frame = TRUE)
+
+factor_gsea_colon <- list()
+
+for (factor_id in unique(all_weights_colon$factor)) {
+  
+  factor_weights <- all_weights_colon[all_weights_colon$factor == factor_id, ]
+  
+  ranks <- factor_weights$value
+  names(ranks) <- factor_weights$feature
+  ranks <- sort(ranks, decreasing = TRUE)
+  
+  hallmark_res <- fgsea(pathways_hallmark, ranks, minSize = 15, maxSize = 500)
+  c2_res       <- fgsea(pathways_c2,       ranks, minSize = 15, maxSize = 500)
+  c6_res       <- fgsea(pathways_c6,       ranks, minSize = 15, maxSize = 500)
+  
+  factor_gsea_colon[[factor_id]] <- list(
+    hallmark_top = hallmark_res[order(hallmark_res$pval), ][1:20, ],
+    c2_top       = c2_res[order(c2_res$pval),             ][1:20, ],
+    c6_top       = c6_res[order(c6_res$pval),             ][1:20, ]
+  )
+}
+
+# Check
+factor_gsea_colon$Factor3$hallmark_top
+```
+
+
+### Interpret Table
+```{r}
+# ============================================================
+# COLON: FGSEA Summary Table
+# ============================================================
+
+fgsea_summary_colon <- lapply(names(factor_gsea_colon), function(fid) {
+  
+  hallmark <- factor_gsea_colon[[fid]]$hallmark_top %>%
+    filter(!is.na(pathway)) %>%
+    arrange(pval) %>%
+    slice_head(n = 5) %>%
+    mutate(label = paste0(gsub("HALLMARK_", "", pathway),
+                          " (NES=", round(NES, 2),
+                          ", p=", signif(pval, 2), ")")) %>%
+    pull(label) %>%
+    paste(collapse = "<br>")
+  
+  c2 <- factor_gsea_colon[[fid]]$c2_top %>%
+    filter(!is.na(pathway)) %>%
+    arrange(pval) %>%
+    slice_head(n = 3) %>%
+    mutate(label = paste0(pathway,
+                          " (NES=", round(NES, 2),
+                          ", p=", signif(pval, 2), ")")) %>%
+    pull(label) %>%
+    paste(collapse = "<br>")
+  
+  c6 <- factor_gsea_colon[[fid]]$c6_top %>%
+    filter(!is.na(pathway)) %>%
+    arrange(pval) %>%
+    slice_head(n = 3) %>%
+    mutate(label = paste0(pathway,
+                          " (NES=", round(NES, 2),
+                          ", p=", signif(pval, 2), ")")) %>%
+    pull(label) %>%
+    paste(collapse = "<br>")
+  
+  top_embeds <- top_embed_colon %>%
+    filter(factor == fid) %>%
+    slice_head(n = 5) %>%
+    mutate(label = paste0(feature, " (w=", round(abs_weight, 3), ")")) %>%
+    pull(label) %>%
+    paste(collapse = "<br>")
+  
+  data.frame(
+    Factor         = fid,
+    Top_Embeddings = top_embeds,
+    Hallmark_GSEA  = hallmark,
+    C2_GSEA        = c2,
+    C6_GSEA        = c6,
+    stringsAsFactors = FALSE
+  )
+}) %>% bind_rows()
+
+fgsea_summary_colon %>%
+  kable(
+    format    = "html",
+    escape    = FALSE,
+    col.names = c("Factor",
+                  "Top Embedding Dims",
+                  "Hallmark Pathways",
+                  "C2 Pathways",
+                  "C6 Pathways"),
+    caption   = "<strong>COLON: FGSEA Enriched Pathways per MOFA Factor and Associated Embedding Dimensions</strong>"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width  = TRUE,
+    font_size   = 12
+  ) %>%
+  column_spec(1, bold = TRUE, width = "70px",  background = "#1a5276", color = "white") %>%
+  column_spec(2, width = "150px", background = "#f0f3f4") %>%
+  column_spec(3, width = "250px") %>%
+  column_spec(4, width = "220px") %>%
+  column_spec(5, width = "220px") %>%
+  row_spec(0, background = "#2e86c1", color = "white", bold = TRUE) %>%
+  scroll_box(width = "100%", height = "700px")
+```
+
+
 
 ## Factor Enrichment plot
 
