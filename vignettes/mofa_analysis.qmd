@@ -1156,6 +1156,370 @@ fgsea_summary_colon %>%
 ```
 
 
+# Survival Analysis
+
+
+
+```{r}
+# ============================================================
+# SURVIVAL DATA PREP — Proper time + censoring construction
+# ============================================================
+
+# Metadata
+
+metadata_colon <- samples_metadata(mofa_object.colon)
+metadata_ov <- samples_metadata(mofa_object.ov)
+#' Correctly build OS time and event indicator
+#'
+#' Rules:
+#'   - os_time  = days_to_death       if dead
+#'   - os_time  = days_to_last_followup if alive/censored
+#'   - os_event = 1 if dead, 0 if censored
+#'   - Drop if BOTH time columns are NA, or time <= 0
+#'
+
+make_surv_df <- function(mofa_obj, meta,
+                         id_col       = "patientID",
+                         death_col    = "patient.days_to_death",
+                         followup_col = "patient.days_to_last_followup",
+                         status_col   = "patient.vital_status",
+                         label        = "") {
+  
+  df <- get_factors(mofa_obj, factors = "all", as.data.frame = TRUE) %>%
+    pivot_wider(names_from = factor, values_from = value) %>%
+    inner_join(meta, by = c("sample" = id_col))
+  
+  n_start <- nrow(df)
+  
+  df <- df %>%
+    mutate(
+      status_clean = tolower(trimws(.data[[status_col]])),
+      
+      os_event = case_when(
+        status_clean == "dead"  ~ 1L,
+        status_clean == "alive" ~ 0L,
+        TRUE                    ~ NA_integer_
+      ),
+      
+      os_time = case_when(
+        os_event == 1L ~ suppressWarnings(as.numeric(.data[[death_col]])),
+        os_event == 0L ~ suppressWarnings(as.numeric(.data[[followup_col]])),
+        TRUE           ~ NA_real_
+      ),
+      
+      # document exclusion reason for audit trail
+      exclusion_reason = case_when(
+        is.na(os_event)          ~ "ambiguous vital status",
+        is.na(os_time)           ~ "missing time",
+        os_time == 0 & os_event == 0 ~ "alive with zero follow-up (uninformative)",
+        os_time == 0 & os_event == 1 ~ "died day 0 (registration artifact)",
+        os_time < 0              ~ "negative follow-up time",
+        TRUE                     ~ "retained"
+      )
+    )
+  
+  # Print exclusion table before filtering
+  cat("\n========== EXCLUSION LOG:", label, "==========\n")
+  df %>%
+    count(exclusion_reason) %>%
+    mutate(pct = round(100 * n / n_start, 1)) %>%
+    arrange(desc(n)) %>%
+    print()
+  
+  # Final analytic dataset
+  final_df <- df %>% filter(exclusion_reason == "retained")
+  
+  cat("Final analytic n:", nrow(final_df),
+      "| Events:", sum(final_df$os_event),
+      "| Censored:", sum(final_df$os_event == 0), "\n")
+  
+  final_df
+}
+
+surv_colon <- make_surv_df(mofa_object.colon, metadata_colon, label = "COLON")
+surv_ov    <- make_surv_df(mofa_object.ov,    metadata_ov,    label = "OV")
+
+
+
+```
+
+
+```{r}
+# ============================================================
+# FINAL COHORT SUMMARY TABLE — ready for slide/methods section
+# ============================================================
+
+# ============================================================
+# FINAL COHORT SUMMARY TABLE — select only needed columns
+# to avoid type conflicts between colon and OV metadata
+# ============================================================
+
+summarise_cohort <- function(surv_df, cancer_label) {
+  surv_df %>%
+    select(sample, os_event, os_time) %>%   # only the 3 columns we need
+    summarise(
+      Cancer           = cancer_label,
+      N_total          = n(),
+      N_events         = sum(os_event),
+      N_censored       = sum(os_event == 0),
+      Event_rate_pct   = round(100 * mean(os_event), 1),
+      Median_days_dead = median(os_time[os_event == 1]),
+      Median_days_alive= median(os_time[os_event == 0]),
+      Max_followup     = max(os_time),
+      N_lt_5y_dead     = sum(os_event == 1 & os_time <  365.25 * 5),
+      N_gte_5y         = sum(os_time >= 365.25 * 5)
+    )
+}
+
+bind_rows(
+  summarise_cohort(surv_colon, "COAD"),
+  summarise_cohort(surv_ov,    "OV")
+) %>%
+  kable(
+    format    = "html",
+    digits    = 0,
+    col.names = c("Cancer", "N", "Deaths", "Censored",
+                  "Event rate (%)",
+                  "Median days (dead)", "Median days (censored)",
+                  "Max follow-up (days)",
+                  "Deaths < 5y", "Alive/followed ≥ 5y"),
+    caption   = "Survival cohort summary after QC exclusions"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE)
+```
+
+
+### KM Overall
+```{r}
+# ============================================================
+# SURVIVAL ANALYSIS — KM + Cox per MOFA Factor
+# Goal: understand which embedding-driven factors associate
+#       with overall survival in COAD and OV
+# ============================================================
+
+library(survival)
+library(survminer)
+library(broom)
+library(purrr)
+
+DAYS_5Y <- 365.25 * 5
+
+# ── 1. OVERALL KM — cohort survival summary ─────────────────
+
+plot_overall_km <- function(surv_df, cancer_label) {
+  
+  fit <- survfit(Surv(os_time, os_event) ~ 1, data = surv_df)
+  
+  p <- ggsurvplot(
+    fit,
+    data             = surv_df,
+    conf.int         = TRUE,
+    conf.int.alpha   = 0.15,
+    risk.table       = TRUE,
+    risk.table.height= 0.25,
+    palette          = "#2c3e50",
+    title            = paste(cancer_label, "— Overall Survival"),
+    subtitle         = paste0("n=", nrow(surv_df),
+                              " | Events=", sum(surv_df$os_event),
+                              " | Censored=", sum(surv_df$os_event == 0)),
+    xlab             = "Days",
+    ylab             = "Overall Survival Probability",
+    surv.median.line = "hv",
+    ggtheme          = theme_bw(base_size = 12),
+    tables.theme     = theme_cleantable()
+  )
+  
+  print(p)
+  invisible(p)
+}
+
+plot_overall_km(surv_colon, "COAD")
+plot_overall_km(surv_ov,    "OV")
+```
+
+
+### Cox Uni
+```{r}
+# ── 2. UNIVARIABLE COX — all factors, continuous ────────────
+
+run_cox_univar <- function(surv_df, cancer_label = "") {
+  
+  factor_cols <- grep("^Factor", names(surv_df), value = TRUE)
+  
+  map_dfr(factor_cols, function(f) {
+    
+    df <- surv_df %>%
+      select(os_time, os_event, score = all_of(f)) %>%
+      filter(!is.na(score))
+    
+    fit <- coxph(Surv(os_time, os_event) ~ scale(score), data = df)
+    
+    tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+      mutate(Factor = f, Cancer = cancer_label)
+    
+  }) %>%
+    select(Cancer, Factor,
+           HR    = estimate,
+           CI_lo = conf.low,
+           CI_hi = conf.high,
+           p.value) %>%
+    mutate(
+      fdr = p.adjust(p.value, method = "BH"),
+      sig = case_when(
+        fdr < 0.001 ~ "***",
+        fdr < 0.01  ~ "**",
+        fdr < 0.05  ~ "*",
+        fdr < 0.1   ~ "†",
+        TRUE        ~ ""
+      )
+    ) %>%
+    arrange(p.value)
+}
+
+cox_uni_colon <- run_cox_univar(surv_colon, "COAD")
+cox_uni_ov    <- run_cox_univar(surv_ov,    "OV")
+```
+
+### Cox Mult
+
+```{r}
+# ── 3. MULTIVARIABLE COX — adjusted for clinical covariates ─
+
+run_cox_multivar <- function(surv_df, cancer_label = "",
+                              covariates = NULL) {
+  factor_cols <- grep("^Factor", names(surv_df), value = TRUE)
+  
+  # keep only covariates present + sufficient variation
+  covariates <- covariates %>%
+    intersect(names(surv_df)) %>%
+    Filter(function(v) {
+      x <- surv_df[[v]]
+      sum(!is.na(x)) >= 20 && length(unique(na.omit(x))) >= 2
+    }, .)
+  
+  message("Covariates used: ", paste(covariates, collapse = ", "))
+  
+  map_dfr(factor_cols, function(f) {
+    
+    df <- surv_df %>%
+      select(os_time, os_event, score = all_of(f),
+             any_of(covariates)) %>%
+      filter(!is.na(score)) %>%
+      mutate(across(where(is.character), as.factor))
+    
+    df <- df[complete.cases(df), ]
+    if (nrow(df) < 20) return(NULL)
+    
+    cov_str     <- if (length(covariates) > 0)
+      paste("+", paste(intersect(covariates, names(df)), collapse = " + "))
+    else ""
+    
+    formula_str <- paste0("Surv(os_time, os_event) ~ scale(score)", cov_str)
+    
+    fit <- tryCatch(
+      coxph(as.formula(formula_str), data = df),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) return(NULL)
+    
+    tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+      filter(term == "scale(score)") %>%
+      mutate(Factor = f, Cancer = cancer_label, n_used = nrow(df))
+    
+  }) %>%
+    select(Cancer, Factor, n_used,
+           HR    = estimate,
+           CI_lo = conf.low,
+           CI_hi = conf.high,
+           p.value) %>%
+    mutate(
+      fdr = p.adjust(p.value, method = "BH"),
+      sig = case_when(
+        fdr < 0.001 ~ "***",
+        fdr < 0.01  ~ "**",
+        fdr < 0.05  ~ "*",
+        fdr < 0.1   ~ "†",
+        TRUE        ~ ""
+      )
+    ) %>%
+    arrange(p.value)
+}
+
+cox_mv_colon <- run_cox_multivar(surv_colon, "COAD",
+                                  c("patient.neoplasm_histologic_grade",
+                                     "patient.ethnicity",
+                                    "patient.age_at_initial_pathologic_diagnosis",
+                                    "patient.lymphatic_invasion",
+                                    "patient.person_neoplasm_cancer_status",
+                                    "patient.tissue_source_site"))
+
+cox_mv_ov    <- run_cox_multivar(surv_ov, "OV",
+                                   c("patient.neoplasm_histologic_grade",
+                                     "patient.ethnicity",
+                                    "patient.age_at_initial_pathologic_diagnosis",
+                                    "patient.lymphatic_invasion",
+                                    "patient.person_neoplasm_cancer_status",
+                                    "patient.tissue_source_site"))
+```
+
+
+```{r}
+plot_forest <- function(uni_df, mv_df, cancer_label) {
+  
+  combined <- bind_rows(
+    uni_df %>% mutate(Model = "Univariable"),
+    mv_df  %>% select(-n_used) %>% mutate(Model = "Multivariable")
+  ) %>%
+    filter(Cancer == cancer_label) %>%
+    mutate(
+      Factor_num = as.numeric(gsub("Factor", "", Factor)),
+      Factor     = fct_reorder(Factor, Factor_num),
+      Model      = factor(Model, levels = c("Univariable", "Multivariable"))
+    )
+  
+  dodge <- position_dodge(width = 0.5)   # works for both points and errorbars
+  
+  ggplot(combined, aes(x = HR, y = Factor, color = Model, shape = Model)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+    
+    # FIX 1: geom_errorbar with orientation = "y" replaces geom_errorbarh
+    geom_errorbar(aes(xmin = CI_lo, xmax = CI_hi),
+                  width     = 0.3,
+                  linewidth = 0.6,
+                  orientation = "y",
+                  position  = dodge) +
+    
+    # FIX 2: position_dodge replaces position_dodgev
+    geom_point(size = 3, position = dodge) +
+    
+    scale_x_log10() +
+    scale_color_manual(values = c(Univariable   = "#2980b9",
+                                  Multivariable = "#c0392b")) +
+    scale_shape_manual(values = c(Univariable   = 16,
+                                  Multivariable = 17)) +
+    labs(
+      title    = paste(cancer_label, "— Cox PH: MOFA Factors vs Overall Survival"),
+      subtitle = "HR per 1 SD increase in factor score (log scale)\nMultivariable: adjusted for age at diag, ethnicity, grade, site, lymph invasion",
+      x        = "Hazard Ratio (95% CI)",
+      y        = NULL,
+      color    = NULL,
+      shape    = NULL
+    ) +
+    theme_bw(base_size = 12) +
+    theme(legend.position  = "top",
+          panel.grid.minor = element_blank())
+}
+
+plot_forest(cox_uni_colon, cox_mv_colon, "COAD")
+plot_forest(cox_uni_ov,    cox_mv_ov,    "OV")
+```
+
+
+
+
+
+
 
 ## Factor Enrichment plot
 
