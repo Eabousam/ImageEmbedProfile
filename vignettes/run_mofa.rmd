@@ -59,7 +59,7 @@ OV_mae_all <- curatedTCGAData(
 
 OV_assays_subset <- c(
     "OV_RNASeq2GeneNorm-20160128", # Gene expression (mRNA abundance).
-    "OV_RPPAArray-20160128", # Methylation (Epigenetic regulation of gene expression.)
+    "OV_RPPAArray-20160128", #
     #"OV_RPPAArray-20160128",# Proteomics (Protein abundance and phosphorylation levels (~200 proteins).)
     "OV_GISTIC_AllByGene-20160128") # Discrete copy number changes per gene (−2 deletion → +2 amplification).
 ov_mae <- OV_mae_all[,,which(names(OV_mae_all) %in% OV_assays_subset)]
@@ -159,10 +159,6 @@ coad_mae_emb <-
 rownames(coad_mae_emb[["slide_assay"]]) <-
     paste0("slide_feat_", seq_len(nrow(coad_mae_emb[["slide_assay"]])))
 
-colData(coad_mae_emb) <- metadata(coad_mae_emb) |> 
-    dplyr::mutate(patient = TCGAutils::TCGAbarcode(sampleMap(coad_mae_emb)$colname))
-
-
 slide_sm <- sampleMap(coad_mae_emb)[sampleMap(coad_mae_emb)$assay == "slide_assay", ]
 patients_with_slide <- unique(slide_sm$primary)   # these are the patients we care about
 
@@ -244,7 +240,6 @@ meta_for_mofa <- data.frame(sample = sample_order, meta_for_mofa, row.names = NU
 # 4. Attach to MOFA object
 samples_metadata(mofa_obj) <- meta_for_mofa
 
-table(meta_for_mofa$patient.tissue_source_site)
 ```
 
 
@@ -302,7 +297,7 @@ mofa_obj <- prepare_mofa(
 # Train the model  
 mofa_obj.trained <- run_mofa(
     mofa_obj,
-    outfile = "mofa_model_ov.hdf5" ,
+    outfile = "mofa_model_colon.hdf5" ,
     use_basilisk = TRUE
 )
 ```
