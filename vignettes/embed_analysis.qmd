@@ -1,0 +1,376 @@
+---
+title: "embed_analysis"
+format: html
+editor: visual
+---
+
+## Libraries
+
+```{r, message=FALSE}
+library(rmarkdown)
+library(knitr)
+library(psych)
+#BiocManager::install("waldronlab/imageFeatureTCGA")
+#packageVersion("imageFeatureTCGA")
+library(imageFeatureTCGA)
+library(curatedTCGAData)
+library(SummarizedExperiment)
+library(dplyr)
+library(TCGAutils)
+library(ggplot2)
+library(pheatmap)
+library(GSVA)
+library(msigdbr)
+
+```
+
+
+
+
+
+# Load slide data catalog (Kidney Renal Cancer)
+
+```{r load embeddings}
+catalog_kidney <- getCatalog("provgigapath") |> 
+    dplyr::filter(level == "slide_level", Project.ID == "TCGA-KIRC") |>
+     dplyr::slice(1:100)
+
+# issue with 
+```
+
+
+# Read Kidney Renal Cancer assay with curatedTCGA
+
+```{r load_rnaseq, message=FALSE}
+#------------------------------------------
+# Load Kidney assays
+#------------------------------------------
+
+kidney_mae_all <- curatedTCGAData(
+  diseaseCode = "KIRC",
+  assays = "*",
+  version = "2.1.1",
+  dry.run = FALSE
+)
+
+kidney_assays_subset <- c(
+    "KIRC_RNASeq2GeneNorm-20160128", # Gene expression (mRNA abundance).
+    "KIRC_RPPAArray-20160128", 
+    "KIRC_mRNAArray-20160128") # Discrete copy number changes per gene (−2 deletion → +2 amplification).
+kidney_mae <- kidney_mae_all[,,which(names(kidney_mae_all) %in% kidney_assays_subset)]
+
+
+```
+
+```{r}
+# linkTCGA will match patients based on TCGA barcodes and keep only those
+# with both molecular and slide data.
+kidney_mae_emb <- linkTCGA(kidney_mae, catalog_kidney, redownload = FALSE, parallel = FALSE)
+
+# Add row names to the slide_assay (needed for downstream)
+rownames(kidney_mae_emb[["slide_assay"]]) <- paste0("slide_feat_", seq_len(nrow(kidney_mae_emb[["slide_assay"]])))
+```
+
+
+
+# Align embeddings
+
+```{r}
+slide_sm <- sampleMap(kidney_mae_emb)[sampleMap(kidney_mae_emb)$assay == "slide_assay", ]
+patients <- unique(slide_sm$primary)
+
+kidney_aligned <- list()
+for (nm in names(experiments(kidney_mae_emb))) {
+  se <- experiments(kidney_mae_emb)[[nm]]
+  mat <- assay(se)                       # features x samples
+  sm <- sampleMap(kidney_mae_emb)[sampleMap(kidney_mae_emb)$assay == nm, ]
+  col_patients <- sm$primary[match(colnames(mat), sm$colname)]
+  
+  patient_mat <- matrix(NA, nrow = nrow(mat), ncol = length(patients),
+                        dimnames = list(rownames(mat), patients))
+  for (pat in patients) {
+    cols <- which(col_patients == pat)
+    if (length(cols) == 1) {
+      patient_mat[, pat] <- mat[, cols]
+    } else if (length(cols) > 1) {
+      patient_mat[, pat] <- rowMeans(mat[, cols, drop = FALSE], na.rm = TRUE)
+    }
+  }
+  # Convert to numeric if needed
+  if (!is.numeric(patient_mat)) {
+    patient_mat <- matrix(as.numeric(patient_mat), nrow = nrow(patient_mat),
+                          dimnames = dimnames(patient_mat))
+  }
+  # Remove all‑NA features
+  keep <- rowSums(!is.na(patient_mat)) > 0
+  kidney_aligned[[nm]] <- patient_mat[keep, , drop = FALSE]
+}
+
+
+```
+
+### Check Patients
+
+```{r}
+# Number of patients after alignment
+n_patients <- ncol(kidney_aligned[["slide_assay"]])
+cat("Patients with both embeddings and molecular data:", n_patients, "\n")
+
+# Dimensions of each assay
+lapply(kidney_aligned, dim)
+```
+
+# Metadata
+```{r}
+# Extract metadata from the MultiAssayExperiment
+coldata <- as.data.frame(colData(kidney_mae_emb))
+coldata$patient <- TCGAbarcode(rownames(coldata), participant = TRUE)
+# Keep one row per patient
+meta <- coldata[!duplicated(coldata$patient), ]
+rownames(meta) <- meta$patient
+
+# Embedding matrix
+embed_mat <- t(kidney_aligned[["slide_assay"]])
+embed_mat <- embed_mat[complete.cases(embed_mat), ]
+
+# Align metadata and embeddings
+common <- intersect(rownames(embed_mat), rownames(meta))
+embed_meta <- embed_mat[common, ]
+meta_sub <- meta[common, ]
+```
+
+
+
+# Embedding structure
+
+```{r}
+# Compute PCA on aligned embeddings
+pca_res <- prcomp(embed_meta, center = TRUE, scale. = TRUE)
+
+# Build data frame for plotting
+pca_df <- as.data.frame(pca_res$x[, 1:2])
+colnames(pca_df) <- c("PC1", "PC2")
+pca_df$Patient <- rownames(pca_df)
+pca_df$Stage <- meta_sub[rownames(pca_df), "pathologic_stage"]
+
+# Remove missing stage
+pca_df <- pca_df[!is.na(pca_df$Stage), ]
+
+# Keep stages with at least 3 patients (ellipse needs n>2)
+stage_counts <- table(pca_df$Stage)
+keep_stages <- names(stage_counts[stage_counts >= 3])
+pca_df <- pca_df[pca_df$Stage %in% keep_stages, ]
+
+# Variance explained
+var_exp <- round(summary(pca_res)$importance[2, 1:2] * 100, 1)
+
+# Plot with ellipses
+ggplot(pca_df, aes(x = PC1, y = PC2, colour = Stage)) +
+  geom_point(size = 2.5, alpha = 0.7) +
+  stat_ellipse(level = 0.95, linetype = 2, size = 0.8) +
+  scale_colour_viridis_d(option = "plasma") +
+  labs(x = paste0("PC1 (", var_exp[1], "%)"),
+       y = paste0("PC2 (", var_exp[2], "%)"),
+       title = "PCA of KIRC embeddings – coloured by pathologic stage",
+       colour = "Stage") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+
+
+
+```{r}
+
+
+# Select the 20 most consistent features (lowest variance)
+# Already have top_consistent from your code
+consistent_mat <- embed_mat[, top_consistent]   # patients x 20
+
+# For clarity, transpose so rows = features, columns = patients
+consistent_mat <- t(consistent_mat)            # 20 features x patients
+
+# Scale each feature (row) to mean 0 and sd 1 (equivalent to scale = "row" in heatmap)
+scaled_mat <- t(scale(t(consistent_mat)))      # rows scaled
+
+# Set patient labels: if many patients (>50), show index or hide
+if (ncol(scaled_mat) > 50) {
+  patient_labels <- rep("", ncol(scaled_mat))   # blank labels to avoid clutter
+} else {
+  patient_labels <- colnames(scaled_mat)
+}
+
+# Create heatmap
+pheatmap(scaled_mat,
+         scale = "none",                     # already scaled
+         cluster_rows = TRUE,                # cluster similar features
+         cluster_cols = TRUE,                # cluster similar patients
+         show_rownames = TRUE,               # show feature names (slide_feat_xxx)
+         show_colnames = (ncol(scaled_mat) <= 50), # show patient IDs only if ≤50
+         labels_col = patient_labels,
+         fontsize_row = 8,
+         fontsize_col = 6,
+         main = "20 most consistent embedding features (lowest variance across patients)\nZ-score scaled by row",
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         legend = TRUE,
+         legend_title = "Row Z‑score")
+```
+
+
+# Correlate embedding features and clinical variables
+
+```{r}
+clinical_vars <- data.frame(
+  age = as.numeric(meta_sub$patient.age_at_initial_pathologic_diagnosis),
+  sex = ifelse(meta_sub$gender == "MALE", 1, 0),
+  pathologic_stage = as.numeric(as.factor(meta_sub$pathologic_stage)),
+  T_stage = as.numeric(as.factor(meta_sub$pathology_T_stage)),
+  N_stage = as.numeric(as.factor(meta_sub$pathology_N_stage)),
+  M_stage = as.numeric(as.factor(meta_sub$pathology_M_stage)),
+  row.names = rownames(meta_sub)
+)
+# Drop all-NA columns
+clinical_vars <- clinical_vars[, colSums(!is.na(clinical_vars)) > 0, drop = FALSE]
+
+# ----- 2. Embedding features (top 50 variable) -----
+embed_mat <- t(kidney_aligned[["slide_assay"]])
+feature_vars <- apply(embed_mat, 2, var, na.rm = TRUE)
+top50 <- order(feature_vars, decreasing = TRUE)[1:min(50, ncol(embed_mat))]
+embed_top <- embed_mat[, top50]
+
+# Remove zero‑variance embedding features
+sd_feat <- apply(embed_top, 2, sd, na.rm = TRUE)
+keep_feat <- which(!is.na(sd_feat) & sd_feat > 0)
+embed_top <- embed_top[, keep_feat, drop = FALSE]
+
+# ----- 3. Align patients -----
+common <- intersect(rownames(embed_top), rownames(clinical_vars))
+embed_aligned <- embed_top[common, , drop = FALSE]
+clin_aligned <- clinical_vars[common, , drop = FALSE]
+
+# Remove zero‑variance clinical variables
+sd_clin <- apply(clin_aligned, 2, sd, na.rm = TRUE)
+keep_clin <- which(!is.na(sd_clin) & sd_clin > 0)
+clin_aligned <- clin_aligned[, keep_clin, drop = FALSE]
+
+# If there are no variable features or no variable clinical variables, stop
+if (ncol(embed_aligned) == 0) stop("No variable embedding features left.")
+if (ncol(clin_aligned) == 0) stop("No variable clinical variables left.")
+
+# ----- 4. Correlation matrix (features x clinical) -----
+cor_mat <- cor(embed_aligned, clin_aligned, use = "pairwise.complete.obs")
+# Remove any columns/rows that are all NA (should not happen after filtering)
+cor_mat <- cor_mat[!apply(is.na(cor_mat), 1, all), , drop = FALSE]
+cor_mat <- cor_mat[, !apply(is.na(cor_mat), 2, all), drop = FALSE]
+
+# If matrix is empty, stop
+if (nrow(cor_mat) == 0 || ncol(cor_mat) == 0) stop("Correlation matrix empty after cleaning.")
+
+
+cluster_rows <- nrow(cor_mat) > 1
+cluster_cols <- ncol(cor_mat) > 1
+
+pheatmap(cor_mat,
+         cluster_rows = cluster_rows,
+         cluster_cols = cluster_cols,
+         main = "Correlation: embedding features vs clinical variables",
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         angle_col = 45,
+         fontsize_row = 8,
+         fontsize_col = 10)
+```
+
+
+# Identify embedding features most correlated with clinical variables
+
+```{r}
+
+# 'cor_mat' is pre‑computed: rows = embedding features, columns = clinical variables
+
+feature_ranking <- list()
+
+for (var in colnames(cor_mat)) {
+  cors <- cor_mat[, var]
+  
+  # Top 10 positive correlations
+  pos_idx <- order(cors, decreasing = TRUE)[1:10]
+  pos_feat <- names(cors)[pos_idx]
+  pos_cor <- cors[pos_idx]
+  
+  # Top 10 negative correlations (most negative first)
+  neg_idx <- order(cors, decreasing = FALSE)[1:10]
+  neg_feat <- names(cors)[neg_idx]
+  neg_cor <- cors[neg_idx]
+  
+  feature_ranking[[var]] <- data.frame(
+    Clinical_Variable = var,
+    Direction = rep(c("Positive", "Negative"), each = 10),
+    Embedding_Feature = c(pos_feat, neg_feat),
+    Correlation = c(pos_cor, neg_cor)
+  )
+}
+
+# Combine all variables into one table and clean row names
+top_features_table <- do.call(rbind, feature_ranking)
+rownames(top_features_table) <- NULL
+```
+
+# Compute pathway scores (GSVA) and correlate with embeddings
+
+```{r}
+# Get Hallmark gene sets
+hallmark <- msigdbr(species = "Homo sapiens", collection = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# RNA‑seq matrix (genes x patients)
+rna_mat <- as.matrix(kidney_aligned[["KIRC_RNASeq2GeneNorm-20160128"]])
+
+# Run ssGSEA to get per‑patient pathway activity scores
+ssgsea_param <- ssgseaParam(exprData = rna_mat, geneSets = hallmark,
+                            alpha = 0.25, normalize = TRUE)
+gsva_scores <- gsva(ssgsea_param, verbose = FALSE)   # pathways x patients
+pathway_scores <- t(gsva_scores)                     # patients x pathways
+
+# Prepare embedding matrix (patients x features)
+embed_mat <- t(kidney_aligned[["slide_assay"]])
+embed_mat <- embed_mat[complete.cases(embed_mat), ]
+
+# Align patients (make sure rows match)
+common <- intersect(rownames(embed_mat), rownames(pathway_scores))
+embed_aligned <- embed_mat[common, ]
+pathway_aligned <- pathway_scores[common, ]
+
+# Correlate each embedding feature with each pathway
+cor_embed_pathway <- cor(embed_aligned, pathway_aligned, use = "pairwise.complete.obs")
+# Result: 768 features (rows) × 50 pathways (columns)
+
+# Identify which embedding features were strongly associated with stage/T_stage (from previous table)
+stage_features <- unique(
+  top_features_table[top_features_table$Clinical_Variable %in% c("pathologic_stage", "T_stage"),
+                     "Embedding_Feature"]
+)
+
+# Subset correlation matrix to only those features
+pathway_cor_subset <- cor_embed_pathway[stage_features, , drop = FALSE]
+
+# For each such feature, get the top 3 positively and negatively correlated pathways
+pathway_summary <- list()
+for (feat in stage_features) {
+  cors <- pathway_cor_subset[feat, ]
+  pos <- sort(cors, decreasing = TRUE)[1:3]
+  neg <- sort(cors, decreasing = FALSE)[1:3]
+  pathway_summary[[feat]] <- data.frame(
+    Embedding_Feature = feat,
+    Direction = rep(c("Positive", "Negative"), each = 3),
+    Pathway = c(names(pos), names(neg)),
+    Correlation = c(pos, neg)
+  )
+}
+pathway_df <- do.call(rbind, pathway_summary)
+rownames(pathway_df) <- NULL
+
+```
+
+
