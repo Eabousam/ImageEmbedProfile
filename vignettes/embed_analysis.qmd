@@ -10,8 +10,6 @@ editor: visual
 library(rmarkdown)
 library(knitr)
 library(psych)
-#BiocManager::install("waldronlab/imageFeatureTCGA")
-packageVersion("imageFeatureTCGA")
 library(imageFeatureTCGA)
 library(curatedTCGAData)
 library(SummarizedExperiment)
@@ -25,13 +23,13 @@ library(tidyr)
 library(patchwork)
 library(survival)
 library(ggrepel)
+library(gridExtra)
 ```
 
 
 # Load slide data catalog (Kidney Renal Cancer)
 
 ```{r load embeddings}
-cat =getCatalog("provgigapath") 
 # Kidney
 catalog_kidney <- getCatalog("provgigapath") |>
     dplyr::filter(level == "slide_level", Project.ID == "TCGA-KIRC")
@@ -102,14 +100,7 @@ READ_mae <- curatedTCGAData(
   dry.run = FALSE
 )
 
-# For OV
-upsetSamples(ovarian_mae_emb, sets = c("slide_assay", "OV_RNASeq2GeneNorm-20160128", 
-                                       "OV_RPPAArray-20160128"))
-upsetSamples(kidney_mae_emb, sets = c("slide_assay", "KIRC_RNASeq2GeneNorm-20160128",
-                                    "KIRC_RPPAArray-20160128", "KIRC_mRNAArray-20160128"))
-# For READ
-upsetSamples(read_mae_emb, sets = c("slide_assay", "READ_RNASeq2GeneNorm-20160128",
-                                    "READ_RPPAArray-20160128", "READ_mRNAArray-20160128"))
+
 
 ```
 
@@ -185,7 +176,7 @@ get_aligned_embedding_metadata <- function(mae_emb) {
 # with both molecular and slide data.
 # Link TCGA
 kidney_mae_emb <- linkTCGA(kidney_mae, catalog_kidney, redownload = T, parallel = T)
-ovarian_mae_emb <- linkTCGA(OV_mae, catalog_ovar, redownload = T, parallel = T)
+ovarian_mae_emb <- linkTCGA(OV_mae, catalog_ovar, redownload = T, parallel = F)
 lung_mae_emb <- linkTCGA(lung_mae, catalog_lung, redownload = T, parallel = T)
 coad_mae_emb <- linkTCGA(COAD_mae, catalog_coad, redownload = T, parallel = T)
 read_mae_emb <- linkTCGA(READ_mae, catalog_rect, redownload = T, parallel = T)
@@ -199,6 +190,16 @@ lung <- get_aligned_embedding_metadata(lung_mae_emb)
 
 ```
 
+```{r}
+# For OV
+upsetSamples(ovarian_mae_emb, sets = c("slide_assay", "OV_RNASeq2GeneNorm-20160128", 
+                                       "OV_RPPAArray-20160128"))
+upsetSamples(kidney_mae_emb, sets = c("slide_assay", "KIRC_RNASeq2GeneNorm-20160128",
+                                    "KIRC_RPPAArray-20160128", "KIRC_mRNAArray-20160128"))
+# For READ
+upsetSamples(read_mae_emb, sets = c("slide_assay", "READ_RNASeq2GeneNorm-20160128",
+                                    "READ_RPPAArray-20160128", "READ_mRNAArray-20160128"))
+```
 
 
 * Check Patients
@@ -211,7 +212,8 @@ cat("Patients with both embeddings and molecular data:", n_patients, "\n")
 lapply(lung, dim)
 ```
 
-# Metadata
+# Preliminary Analysis PCA: Kidney Cancer
+
 ```{r}
 
 # Metadata 
@@ -222,7 +224,7 @@ meta_sub <- kirc$meta     # metadata aligned to patients
 
 
 
-# Embedding structure
+### Embedding structure
 
 ```{r}
 
@@ -302,7 +304,8 @@ p2 <- ggplot(low_long, aes(x = Feature, y = Value)) +
 p1 + p2
 ```
 
-## PCA
+### PCA
+
 ```{r}
 # Compute PCA on aligned embeddings
 pca_res <- prcomp(embed_mat, center = TRUE, scale. = TRUE)
@@ -340,7 +343,7 @@ ggplot(pca_df, aes(x = PC1, y = PC2, colour = Stage)) +
 ```
 
 
-# Correlate embedding features and clinical variables
+### Correlate embedding features and clinical variables
 
 ```{r}
 clinical_vars <- data.frame(
@@ -403,7 +406,9 @@ pheatmap(cor_mat,
 ```
 
 
-# Univariate associations with clinical features
+# All Cancer Analysis
+
+### Univariate associations with clinical features 
 
 ```{r}
 
@@ -438,7 +443,7 @@ get_stage_coefficients <- function(embed_mat, meta_sub, fdr_thresh = 0.2) {
 ```
 
 
-# run the linear models
+### run the linear models
 
 
 ```{r}
@@ -454,9 +459,9 @@ coad_res$Cancer <- "COAD"
 lung_res$Cancer <- "LUAD"
 ```
 
-# Coeff Heatmap
+### Coeff Heatmap
 
-## Visualize the top features associated with stage in each cancer, side by side, and then combined into one heatmap
+### Visualize the top features associated with stage in each cancer, side by side, and then combined into one heatmap
 
 ```{r}
 
@@ -514,8 +519,6 @@ p_lung <- pheatmap(mat_luad,
                    legend_title = "Coefficient",
                    silent = TRUE)
 
-# Arrange side by side
-library(gridExtra)
 grid.arrange(p_kirc[[4]], p_coad[[4]], p_lung[[4]],  ncol = 3,
              top = "Top embedding features associated with pathologic stage (FDR < 0.2)")
 ```
@@ -553,7 +556,6 @@ if (nrow(coeff_matrix) > top_n) {
 coeff_matrix <- coeff_matrix[order(mean_coef, decreasing = TRUE), ]
 
 # Heatmap
-library(pheatmap)
 pheatmap(coeff_matrix,
          cluster_rows = FALSE,          # keep our custom order
          cluster_cols = FALSE,
@@ -1147,7 +1149,6 @@ final_table_with_links <- final_table %>%
 
 
 
-library(kableExtra)
 final_table_with_links %>%
   kbl(
     caption = "Top survival‑associated embeddings and their pathway correlations",
@@ -1157,4 +1158,9 @@ final_table_with_links %>%
   kable_classic(full_width = FALSE)
 
 ```
+
+
+
+
+
 
