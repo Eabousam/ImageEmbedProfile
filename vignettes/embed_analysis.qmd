@@ -451,12 +451,15 @@ get_stage_coefficients <- function(embed_mat, meta_sub, fdr_thresh = 0.2) {
 kirc_res <- get_stage_coefficients(kirc$embed, kirc$meta, fdr_thresh = 0.5)
 coad_res <- get_stage_coefficients(coad$embed, coad$meta, fdr_thresh = 0.5)
 lung_res <- get_stage_coefficients(lung$embed, lung$meta, fdr_thresh = 0.5)
-ov_res <- get_stage_coefficients(ov$embed, ov$meta, fdr_thresh = 1)
+# fix naming of stage for OV
+ov$meta$pathologic_stage <- ov$meta$patient.stage_event.clinical_stage
+ov_res <- get_stage_coefficients(ov$embed, ov$meta, fdr_thresh = 0.2)
 read_res <- get_stage_coefficients(read$embed, read$meta, fdr_thresh = 0.5)
 # Add cancer label
 kirc_res$Cancer <- "KIRC"
 coad_res$Cancer <- "COAD"
 lung_res$Cancer <- "LUAD"
+ov_res$Cancer <- "OV"
 ```
 
 ### Coeff Heatmap
