@@ -23,19 +23,21 @@ library(GSVA)
 library(msigdbr)
 library(tidyr)
 library(patchwork)
-
+library(survival)
+library(ggrepel)
 ```
 
 
 # Load slide data catalog (Kidney Renal Cancer)
 
 ```{r load embeddings}
+cat =getCatalog("provgigapath") 
 # Kidney
 catalog_kidney <- getCatalog("provgigapath") |>
     dplyr::filter(level == "slide_level", Project.ID == "TCGA-KIRC")
 
 
-# Ovarian
+# lung
 catalog_lung <- getCatalog("provgigapath") |> 
     dplyr::filter(level == "slide_level", Project.ID == "TCGA-LUAD")
 
@@ -43,6 +45,15 @@ catalog_lung <- getCatalog("provgigapath") |>
 # Colorectal
 catalog_coad <- getCatalog("provgigapath") |> 
     dplyr::filter(level == "slide_level", Project.ID == "TCGA-COAD")
+
+
+# Ovarian
+catalog_ovar <- getCatalog("provgigapath") |>
+    dplyr::filter(level == "slide_level", Project.ID == "TCGA-OV")
+
+# Rectal
+catalog_rect <- getCatalog("provgigapath") |>
+    dplyr::filter(level == "slide_level", Project.ID == "TCGA-READ")
 
 
 
@@ -75,12 +86,41 @@ COAD_mae <- curatedTCGAData(
   dry.run = FALSE
 )
 
+
+OV_mae <- curatedTCGAData(
+  diseaseCode = "OV",
+  assays =  c("RNASeq2GeneNorm", "RPPAArray", "mRNAArray"),
+  version = "2.1.1",
+  dry.run = FALSE
+)
+
+
+READ_mae <- curatedTCGAData(
+  diseaseCode = "READ",
+  assays = c("RNASeq2GeneNorm", "RPPAArray", "mRNAArray"),
+  version = "2.1.1",
+  dry.run = FALSE
+)
+
+# For OV
+upsetSamples(ovarian_mae_emb, sets = c("slide_assay", "OV_RNASeq2GeneNorm-20160128", 
+                                       "OV_RPPAArray-20160128"))
+upsetSamples(kidney_mae_emb, sets = c("slide_assay", "KIRC_RNASeq2GeneNorm-20160128",
+                                    "KIRC_RPPAArray-20160128", "KIRC_mRNAArray-20160128"))
+# For READ
+upsetSamples(read_mae_emb, sets = c("slide_assay", "READ_RNASeq2GeneNorm-20160128",
+                                    "READ_RPPAArray-20160128", "READ_mRNAArray-20160128"))
+
 ```
 
 
 # Align embeddings
 
 ### Helper Function
+
+* Make sure there's no redundant samples
+* Averages all samples belonging to one patient
+
 
 ```{r}
 get_aligned_embedding_metadata <- function(mae_emb) {
@@ -145,13 +185,15 @@ get_aligned_embedding_metadata <- function(mae_emb) {
 # with both molecular and slide data.
 # Link TCGA
 kidney_mae_emb <- linkTCGA(kidney_mae, catalog_kidney, redownload = T, parallel = T)
-#ovarian_mae_emb <- linkTCGA(ov_mae, catalog_ovarian, redownload = T, parallel = T)
+ovarian_mae_emb <- linkTCGA(OV_mae, catalog_ovar, redownload = T, parallel = T)
 lung_mae_emb <- linkTCGA(lung_mae, catalog_lung, redownload = T, parallel = T)
 coad_mae_emb <- linkTCGA(COAD_mae, catalog_coad, redownload = T, parallel = T)
+read_mae_emb <- linkTCGA(READ_mae, catalog_rect, redownload = T, parallel = T)
 # Get aligned embedding + metadata
 
 kirc <- get_aligned_embedding_metadata(kidney_mae_emb)
-#ov <- get_aligned_embedding_metadata(ovarian_mae_emb)
+ov <- get_aligned_embedding_metadata(ovarian_mae_emb)
+read <- get_aligned_embedding_metadata(read_mae_emb)
 coad <- get_aligned_embedding_metadata(coad_mae_emb)
 lung <- get_aligned_embedding_metadata(lung_mae_emb)
 
@@ -404,6 +446,8 @@ get_stage_coefficients <- function(embed_mat, meta_sub, fdr_thresh = 0.2) {
 kirc_res <- get_stage_coefficients(kirc$embed, kirc$meta, fdr_thresh = 0.5)
 coad_res <- get_stage_coefficients(coad$embed, coad$meta, fdr_thresh = 0.5)
 lung_res <- get_stage_coefficients(lung$embed, lung$meta, fdr_thresh = 0.5)
+ov_res <- get_stage_coefficients(ov$embed, ov$meta, fdr_thresh = 1)
+read_res <- get_stage_coefficients(read$embed, read$meta, fdr_thresh = 0.5)
 # Add cancer label
 kirc_res$Cancer <- "KIRC"
 coad_res$Cancer <- "COAD"
@@ -524,27 +568,75 @@ pheatmap(coeff_matrix,
 
 # Survival Cox univariate
 
+
+### Prep Surv Data
 ```{r}
-kirc_meta <- lung$meta
-names(kirc_meta)
-kirc_meta %>%
-  select(patient.days_to_last_followup, days_to_last_followup, days_to_death)
+# ----- KIRC -----
+
+kirc$meta$event <- as.numeric(kirc$meta$vital_status == 1)   # 1 = dead, 0 = alive
+kirc$meta$time <- ifelse(kirc$meta$event == 1,
+                         kirc$meta$days_to_death,
+                         kirc$meta$patient.days_to_last_followup)
+# Remove patients with missing time or event
+kirc$meta <- kirc$meta[!is.na(kirc$meta$time) & !is.na(kirc$meta$event), ]
+
+# ----- COAD -----
+# Best columns: event = vital_status.x, death = days_to_death.x, follow = patient.days_to_last_followup
+coad$meta$event <- as.numeric(coad$meta$vital_status.x == 1)   # 1 = dead, 0 = alive
+coad$meta$time <- ifelse(coad$meta$event == 1,
+                         coad$meta$days_to_death.x,
+                         coad$meta$patient.days_to_last_followup)
+# Remove rows with missing time or event
+coad$meta <- coad$meta[!is.na(coad$meta$time) & !is.na(coad$meta$event), ]
+
+# ----- LUAD -----
+
+lung$meta$event <- as.numeric(lung$meta$vital_status == 1)   # 1 = dead, 0 = alive
+lung$meta$time <- ifelse(lung$meta$event == 1,
+                         lung$meta$days_to_death,
+                         lung$meta$patient.days_to_last_followup)
+# Remove rows with missing time or event
+lung$meta <- lung$meta[!is.na(lung$meta$time) & !is.na(lung$meta$event), ]
+
+
+# ----- OV -----
+
+ov$meta$event <- as.numeric(ov$meta$vital_status == 1)   # 1 = dead, 0 = alive
+ov$meta$time <- ifelse(ov$meta$event == 1,
+                         ov$meta$days_to_death,
+                         ov$meta$patient.days_to_last_followup)
+# Remove rows with missing time or event
+ov$meta <- ov$meta[!is.na(ov$meta$time) & !is.na(ov$meta$event), ]
+
+
+# ----- READ -----
+
+read$meta$event <- as.numeric(read$meta$vital_status == 1)   # 1 = dead, 0 = alive
+read$meta$time <- ifelse(read$meta$event == 1,
+                         read$meta$days_to_death,
+                         read$meta$patient.days_to_last_followup)
+# Remove rows with missing time or event
+read$meta <- read$meta[!is.na(read$meta$time) & !is.na(read$meta$event), ]
+```
+
+```{r}
+cat("KIRC: ", nrow(kirc$meta), " patients, events: ", sum(kirc$meta$event), "\n")
+cat("COAD: ", nrow(coad$meta), " patients, events: ", sum(coad$meta$event), "\n")
+cat("LUAD: ", nrow(lung$meta), " patients, events: ", sum(lung$meta$event), "\n")
+cat("OV: ", nrow(ov$meta), " patients, events: ", sum(ov$meta$event), "\n")
+cat("READ: ", nrow(read$meta), " patients, events: ", sum(read$meta$event), "\n")
 ```
 
 
 
 
-
-
 ```{r}
-get_survival_coefficients <- function(embed_mat, meta_sub, time_col = "days_to_death", 
-                                      event_col = "vital_status", fdr_thresh = 0.2) {
+get_survival_coefficients <- function(embed_mat, meta_sub, time_col = "time", 
+                                      event_col = "event", fdr_thresh = 0.2) {
   # embed_mat: patients x features
   # meta_sub: data frame with patient metadata (must contain time and event columns)
   # time_col: column name for survival time (days)
   # event_col: column name for event (1 = death, 0 = censored)
-  
-  library(survival)
   
   # Align patients
   common <- intersect(rownames(embed_mat), rownames(meta_sub))
@@ -592,96 +684,142 @@ get_survival_coefficients <- function(embed_mat, meta_sub, time_col = "days_to_d
 
 
 ```{r}
-t = as.data.frame(kirc$meta)
-table(lung$meta$vital_status)
+
 # For KIRC
 kirc_surv <- get_survival_coefficients(kirc$embed, kirc$meta,
-                                       time_col = "days_to_death",
-                                       event_col = "vital_status",
+                                       time_col = "time",
+                                       event_col = "event",
                                        fdr_thresh = 0.5)
 
 # For COAD
 coad_surv <- get_survival_coefficients(coad$embed, coad$meta,
-                                       time_col = "days_to_death.x",
-                                       event_col = "vital_status.x",
+                                       time_col = "time",
+                                       event_col = "event",
                                        fdr_thresh = 0.2)
 
 # For LUAD
 lung_surv <- get_survival_coefficients(lung$embed, lung$meta,
-                                       time_col = "days_to_death",
-                                       event_col = "vital_status",
+                                       time_col = "time",
+                                       event_col = "event",
                                        fdr_thresh = 0.2)
+
+# For OV
+ov_surv <- get_survival_coefficients(ov$embed, ov$meta,
+                                       time_col = "time",
+                                       event_col = "event",
+                                       fdr_thresh = 0.2)
+
+# For Read
+read_surv <- get_survival_coefficients(read$embed, read$meta,
+                                       time_col = "time",
+                                       event_col = "event",
+                                       fdr_thresh = 0.8)
+
 
 # Add cancer labels
 kirc_surv$Cancer <- "KIRC"
 coad_surv$Cancer <- "COAD"
 lung_surv$Cancer <- "LUAD"
-
+ov_surv$Cancer <- "OV"
+read_surv$Cancer <- "READ"
 
 ```
 
 
 ```{r}
-n_top <- 30
+# List all cancer survival results
+all_surv <- list(
+  KIRC = kirc_surv,
+  COAD = coad_surv,
+  LUAD = lung_surv,
+  OV   = ov_surv,
+  READ = read_surv
+)
 
-# KIRC
-kirc_top_s <- kirc_surv[order(-abs(kirc_surv$LogHR)), ][1:n_top, ]
-kirc_top_s <- kirc_top_s[order(-kirc_top_s$LogHR), ]
-mat_kirc_s <- matrix(kirc_top_s$LogHR, ncol = 1,
-                     dimnames = list(kirc_top_s$Feature, "KIRC"))
+# ------------------------------
+# 1. Select top 20 features per cancer (by absolute LogHR)
+# ------------------------------
+n_top_per_cancer <- 30
 
-# COAD
-coad_top_s <- coad_surv[order(-abs(coad_surv$LogHR)), ][1:n_top, ]
-coad_top_s <- coad_top_s[order(-coad_top_s$LogHR), ]
-mat_coad_s <- matrix(coad_top_s$LogHR, ncol = 1,
-                     dimnames = list(coad_top_s$Feature, "COAD"))
+top_features_per_cancer <- lapply(all_surv, function(df) {
+  df %>%
+    arrange(desc(abs(LogHR))) %>%
+    slice_head(n = n_top_per_cancer) %>%
+    pull(Feature)
+})
 
-# LUAD
-lung_top_s <- lung_surv[order(-abs(lung_surv$LogHR)), ][1:n_top, ]
-lung_top_s <- lung_top_s[order(-lung_top_s$LogHR), ]
-mat_lung_s <- matrix(lung_top_s$LogHR, ncol = 1,
-                     dimnames = list(lung_top_s$Feature, "LUAD"))
+# Union of all top features
+all_features <- unique(unlist(top_features_per_cancer))
 
-# Create heatmaps
-p_kirc_s <- pheatmap(mat_kirc_s, cluster_rows = FALSE, cluster_cols = FALSE,
-                     color = colorRampPalette(c("steelblue", "white", "firebrick3"))(50),
-                     fontsize_row = 8, legend_title = "Log HR", silent = TRUE)
-p_coad_s <- pheatmap(mat_coad_s, cluster_rows = FALSE, cluster_cols = FALSE,
-                     color = colorRampPalette(c("steelblue", "white", "firebrick3"))(50),
-                     fontsize_row = 8, legend_title = "Log HR", silent = TRUE)
-p_lung_s <- pheatmap(mat_lung_s, cluster_rows = FALSE, cluster_cols = FALSE,
-                     color = colorRampPalette(c("steelblue", "white", "firebrick3"))(50),
-                     fontsize_row = 8, legend_title = "Log HR", silent = TRUE)
+# ------------------------------
+# 2. Build coefficient matrix (only rows for those features)
+# ------------------------------
+coeff_matrix <- matrix(NA, nrow = length(all_features), ncol = length(all_surv),
+                       dimnames = list(all_features, names(all_surv)))
 
-grid.arrange(p_kirc_s[[4]], p_coad_s[[4]], p_lung_s[[4]], ncol = 3,
-             top = "Top embedding features associated with survival (FDR < 0.2)")
+for (cancer in names(all_surv)) {
+  df <- all_surv[[cancer]]
+  # Only assign for features that exist in the matrix rows
+  common <- intersect(df$Feature, rownames(coeff_matrix))
+  if (length(common) > 0) {
+    coeff_matrix[common, cancer] <- df$LogHR[match(common, df$Feature)]
+  }
+}
+
+# Remove any all‑NA rows (shouldn't happen, but safe)
+coeff_matrix <- coeff_matrix[!apply(is.na(coeff_matrix), 1, all), ]
+
+# ------------------------------
+# 3. Order rows by mean LogHR (positive to negative)
+# ------------------------------
+mean_coef <- rowMeans(coeff_matrix, na.rm = TRUE)
+coeff_matrix <- coeff_matrix[order(mean_coef, decreasing = TRUE), ]
+
+# ------------------------------
+# 4. Heatmap
+# ------------------------------
+pheatmap(coeff_matrix,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         na_col = "grey90",
+         color = colorRampPalette(c("steelblue", "white", "firebrick3"))(50),
+         main = paste0("Log Hazard Ratios (survival ~ embedding feature)\nTop ", n_top_per_cancer, " features per cancer (union)"),
+         fontsize_row = 6,
+         angle_col = 45,
+         legend_title = "Log HR")
 ```
-
 
 
 
 # Compute pathway scores (GSVA) and correlate with embeddings
 
+1. We build pathway_scores from the RNA‑seq data via GSVA – patients × pathways.
+
+2. We have the embedding matrix – patients × features.
+
+3. We correlate features with pathways for the same patients.
+
+4. We take the intersection of patient IDs to ensure both matrices have identical rows.
+
+5. We subset both matrices to those common patients.
+
+6. Finally, we compute cor(embed_aligned, pathway_aligned) – each row of embeds corresponds to the same patient as the corresponding row of pathways.
+
+
 
 ```{r}
-get_gsva_pathway <- function(mae_emb, rna_assay_name, aligned_list, res, top_n = NULL) {
-  # mae_emb: MultiAssayExperiment from linkTCGA
-  # rna_assay_name: character, e.g. "KIRC_RNASeq2GeneNorm-20160128"
-  # aligned_list: list with $embed (patients x features) and $meta
-  # res: data frame from get_stage_coefficients (with Feature, Coefficient, FDR)
-  # top_n: optional, number of top stage‑associated features to use (by |Coefficient|)
-  
-  # 1. Get Hallmark gene sets (cached)
+get_gsva_pathway <- function(mae_emb, rna_assay_name, aligned_list, res, 
+                             top_n = NULL, min_n = 30) {
+  # 1. Get Hallmark gene sets
   hallmark <- msigdbr(species = "Homo sapiens", collection = "H") %>%
     split(x = .$gene_symbol, f = .$gs_name)
   
-  # 2. Extract RNA and align to patients (patients from aligned_list$embed)
+  # 2. Extract RNA and align to the patients in aligned_list$embed
   rna_se <- mae_emb[[rna_assay_name]]
-  rna_mat <- assay(rna_se)  # genes x samples
-  
+  rna_mat <- assay(rna_se)
   sm <- sampleMap(mae_emb)
   sm_rna <- sm[sm$assay == rna_assay_name, ]
-  patients <- rownames(aligned_list$embed)
+  patients <- rownames(aligned_list$embed)   # already standardised
   
   rna_patient <- matrix(NA, nrow = nrow(rna_mat), ncol = length(patients),
                         dimnames = list(rownames(rna_mat), patients))
@@ -691,72 +829,116 @@ get_gsva_pathway <- function(mae_emb, rna_assay_name, aligned_list, res, top_n =
       rna_patient[, pat] <- rowMeans(rna_mat[, cols, drop = FALSE], na.rm = TRUE)
     }
   }
+  # Drop genes that are all NA
   keep <- rowSums(!is.na(rna_patient)) > 0
   rna_patient <- rna_patient[keep, , drop = FALSE]
   
   # 3. GSVA
   ssgsea_param <- ssgseaParam(exprData = rna_patient, geneSets = hallmark,
                               alpha = 0.25, normalize = TRUE)
-  gsva_scores <- gsva(ssgsea_param, verbose = FALSE)   # pathways x patients
-  pathway_scores <- t(gsva_scores)                     # patients x pathways
+  gsva_scores <- gsva(ssgsea_param, verbose = FALSE)
+  pathway_scores <- t(gsva_scores)
   
-  # 4. Align with embeddings
+  # 4. Standardise pathway score patient IDs (to match embedding IDs)
+  rownames(pathway_scores) <- TCGAbarcode(rownames(pathway_scores), participant = TRUE)
+  
+  # 5. Align patients – `aligned_list$embed` already has standardised IDs
   common <- intersect(rownames(aligned_list$embed), rownames(pathway_scores))
-  embed_aligned <- aligned_list$embed[common, ]
-  pathway_aligned <- pathway_scores[common, ]
+  if (length(common) < 3) {
+    warning("Fewer than 3 common patients – returning empty.")
+    return(data.frame())
+  }
+  embed_aligned <- aligned_list$embed[common, , drop = FALSE]
+  pathway_aligned <- pathway_scores[common, , drop = FALSE]
   
-  # 5. Correlation (features x pathways)
-  cor_embed_pathway <- cor(embed_aligned, pathway_aligned, use = "pairwise.complete.obs")
+  # 6. Remove sparse pathways (too many NAs)
+  n_valid <- colSums(!is.na(pathway_aligned))
+  pathway_aligned <- pathway_aligned[, n_valid >= min_n, drop = FALSE]
   
-  # 6. Select stage‑associated features (from regression results)
-  if (!is.null(top_n) && top_n < nrow(res)) {
-    stage_features <- head(res[order(-abs(res$Coefficient)), "Feature"], top_n)
+  # 7. Remove constant pathways (zero variance)
+  const_path <- apply(pathway_aligned, 2, function(x) length(unique(x)) == 1)
+  pathway_aligned <- pathway_aligned[, !const_path, drop = FALSE]
+  
+  # 8. Remove zero‑variance embedding features
+  feat_var <- apply(embed_aligned, 2, var, na.rm = TRUE)
+  embed_aligned <- embed_aligned[, feat_var > 1e-6, drop = FALSE]
+  
+  # 9. Spearman correlation
+  cor_embed_pathway <- cor(embed_aligned, pathway_aligned, 
+                           method = "spearman", use = "pairwise.complete.obs")
+  
+  # 10. Blank correlations with effective n < min_n
+  n_pairs <- crossprod(!is.na(embed_aligned), !is.na(pathway_aligned))
+  cor_embed_pathway[n_pairs < min_n] <- NA
+  
+  # 11. Select top features from regression results
+  coef_col <- if ("Coefficient" %in% colnames(res)) "Coefficient" else "LogHR"
+  if (!is.numeric(res[[coef_col]])) res[[coef_col]] <- as.numeric(res[[coef_col]])
+  
+  selected_features <- if (!is.null(top_n) && top_n < nrow(res)) {
+    head(res[order(-abs(res[[coef_col]])), "Feature"], top_n)
   } else {
-    stage_features <- res$Feature
+    res$Feature
   }
   
-  # 7. Subset correlation matrix
-  pathway_cor_subset <- cor_embed_pathway[stage_features, , drop = FALSE]
+  # 12. Subset correlation matrix
+  pathway_cor_subset <- cor_embed_pathway[selected_features, , drop = FALSE]
   
-  # 8. For each feature, get top 3 positive and negative pathways
+  # 13. For each feature, get top 3 positive and negative pathways
   pathway_summary <- list()
-  for (feat in stage_features) {
+  for (feat in selected_features) {
     cors <- pathway_cor_subset[feat, ]
-    pos <- sort(cors, decreasing = TRUE)[1:3]
-    neg <- sort(cors, decreasing = FALSE)[1:3]
+    cors <- cors[!is.na(cors)]
+    if (length(cors) == 0) next
+    pos <- sort(cors, decreasing = TRUE)[1:min(3, length(cors))]
+    neg <- sort(cors, decreasing = FALSE)[1:min(3, length(cors))]
     pathway_summary[[feat]] <- data.frame(
       Embedding_Feature = feat,
-      Direction = rep(c("Positive", "Negative"), each = 3),
+      Direction = rep(c("Positive", "Negative"), each = length(pos)),
       Pathway = c(names(pos), names(neg)),
       Correlation = c(pos, neg),
       stringsAsFactors = FALSE
     )
   }
+  
   pathway_df <- do.call(rbind, pathway_summary)
   rownames(pathway_df) <- NULL
   
   return(pathway_df)
 }
+
 ```
 
 
+* Note here: For a given embedding feature (e.g., slide_feat_144) and a given pathway (e.g., HALLMARK_APICAL_JUNCTION), we compute the Spearman correlation between the vector of embedding values across patients and the vector of pathway scores across the same patients.
+
+
+* To avoid perfect corr and issues with missingness, we will filter so the data has at least min of 30 non‑NA patients to ensure reliability.
+
+
 ```{r}
-# KIRC
+
+# KIRC – use kirc_surv
+
 pathway_kirc <- get_gsva_pathway(
   mae_emb = kidney_mae_emb,
   rna_assay_name = "KIRC_RNASeq2GeneNorm-20160128",
   aligned_list = kirc,
-  res = kirc_res,
-  top_n = 30   # use top 30 stage features (by |coefficient|)
+  res = kirc_surv,  
+  top_n = 20,
+  min_n = 30
 )
 
 # COAD
+
 pathway_coad <- get_gsva_pathway(
   mae_emb = coad_mae_emb,
   rna_assay_name = "COAD_RNASeq2GeneNorm-20160128",
   aligned_list = coad,
-  res = coad_res,
-  top_n = 30
+  res = coad_surv,
+  top_n = 30,
+      min_n = 30
+
 )
 
 # LUAD
@@ -764,9 +946,215 @@ pathway_luad <- get_gsva_pathway(
   mae_emb = lung_mae_emb,
   rna_assay_name = "LUAD_RNASeq2Gene-20160128",
   aligned_list = lung,
-  res = lung_res,
-  top_n = 30
+  res = lung_surv,  
+  top_n = 30,
+  min_n = 30
+)
+
+# OV
+
+pathway_ov <- get_gsva_pathway(
+  mae_emb = ovarian_mae_emb,
+  rna_assay_name = "OV_RNASeq2GeneNorm-20160128",
+  aligned_list = ov,
+  res = ov_surv,    
+  top_n = 30,
+  min_n = 30
+)
+
+# READ
+pathway_read <- get_gsva_pathway(
+  mae_emb = read_mae_emb,
+  rna_assay_name = "READ_RNASeq2GeneNorm-20160128",
+  aligned_list = read,
+  res = read_surv, 
+  top_n = 30,
+  min_n = 30
 )
 ```
 
+## Check overlapping
+```{r}
+# Get feature lists
+surv_features <- rownames(coeff_matrix)  # from your survival heatmap
+pathway_features <- unique(pathway_ov$Embedding_Feature)
+
+# Overlap
+intersect(surv_features, pathway_features)
+
+# Features in survival but missing from pathway
+setdiff(surv_features, pathway_features)
+```
+
+
+
+# Check Missingness
+```{r}
+
+
+# Function to summarise missingness for a given assay
+assay_missingness <- function(mae_emb, assay_name) {
+  se <- mae_emb[[assay_name]]
+  mat <- assay(se)
+  
+  # Overall missingness
+  total_cells <- prod(dim(mat))
+  missing_cells <- sum(is.na(mat))
+  missing_pct <- 100 * missing_cells / total_cells
+  
+  cat(sprintf("\n[%s] Total cells: %d, Missing: %d (%.2f%%)\n", 
+              assay_name, total_cells, missing_cells, missing_pct))
+  
+  # Per‑sample missingness
+  sample_missing <- colSums(is.na(mat))
+  df_sample <- data.frame(Sample = colnames(mat), Missing = sample_missing)
+  
+  p1 <- ggplot(df_sample, aes(x = reorder(Sample, Missing), y = Missing)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(title = paste("Missing values per sample:", assay_name),
+         x = "Sample", y = "Number of missing genes") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 6))
+  
+  # Per‑gene missingness
+  gene_missing <- rowSums(is.na(mat))
+  p2 <- ggplot(data.frame(Missing = gene_missing), aes(x = Missing)) +
+    geom_histogram(bins = 30, fill = "firebrick3", alpha = 0.7) +
+    labs(title = paste("Missing values per gene:", assay_name),
+         x = "Number of samples with missing value", y = "Frequency") +
+    theme_minimal()
+  
+  return(list(overall = c(total_cells, missing_cells, missing_pct),
+              sample_plot = p1, gene_plot = p2))
+}
+
+out_kirc <- assay_missingness(kidney_mae_emb, "KIRC_RNASeq2GeneNorm-20160128")
+out_kirc$sample_plot
+out_kirc$gene_plot
+
+
+out_ov <- assay_missingness(ovarian_mae_emb, "OV_RNASeq2GeneNorm-20160128")
+out_ov$sample_plot
+out_ov$gene_plot
+```
+
+
+# GSVA Embedding corr table
+
+```{r}
+pathway_list <- list(
+  KIRC = pathway_kirc,
+  COAD = pathway_coad,
+  LUAD = pathway_luad,
+  OV   = pathway_ov,
+  READ = pathway_read
+)
+
+summary_list <- list()
+
+for (cancer in names(pathway_list)) {
+  df <- pathway_list[[cancer]]
+  if (is.null(df) || nrow(df) == 0) next
+  
+  # For each feature, pick the strongest association (highest |Correlation|)
+  top_per_feature <- df %>%
+    group_by(Embedding_Feature) %>%
+    slice_max(order_by = abs(Correlation), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(desc(abs(Correlation))) %>%
+    slice_head(n = 5)   # keep top 5 features per cancer
+  
+  if (nrow(top_per_feature) > 0) {
+    # Add LogHR from survival matrix
+    top_per_feature$LogHR <- sapply(top_per_feature$Embedding_Feature, function(f) {
+      if (f %in% rownames(coeff_matrix)) {
+        coeff_matrix[f, cancer]
+      } else {
+        NA
+      }
+    })
+    top_per_feature$Cancer <- cancer
+    summary_list[[cancer]] <- top_per_feature
+  }
+}
+
+# Combine and reorder columns
+final_table <- bind_rows(summary_list) %>%
+  select(Cancer, Embedding_Feature, LogHR, Pathway, Correlation, Direction)
+
+# Optional: filter to |Correlation| > 0.2
+final_table <- final_table %>% filter(abs(Correlation) > 0.2)
+
+
+```
+
+```{r}
+# Prepare data
+sign_embed_data <- final_table %>%
+  mutate(
+    Cancer = factor(Cancer, levels = c("KIRC", "COAD", "LUAD", "OV", "READ")),
+    Label = paste0(Embedding_Feature, "\n", Pathway)
+  )
+
+# Scatter plot
+ggplot(sign_embed_data, aes(x = LogHR, y = Correlation, color = Cancer)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_text_repel(aes(label = Label), size = 3, max.overlaps = 15) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Survival-associated embeddings and their pathway correlations",
+    x = "Log Hazard Ratio (survival)",
+    y = "Spearman correlation with Hallmark pathway",
+    color = "Cancer"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+
+
+# Full Table
+
+```{r}
+# Assume final_table is your existing data frame
+
+final_table_with_links <- final_table %>%
+  mutate(
+    # Add clickable link
+    # Add a placeholder interpretation (you can replace these with your own text)
+    Interpretation = case_when(
+      Pathway == "HALLMARK_APICAL_JUNCTION" ~ "Cell–cell adhesion; may reflect epithelial disorganisation.",
+      Pathway == "HALLMARK_IL6_JAK_STAT3_SIGNALING" ~ "Inflammatory signalling; often pro‑tumorigenic.",
+      Pathway == "HALLMARK_HEME_METABOLISM" ~ "Erythroid/metabolic pathway; suggests metabolic reprogramming.",
+      Pathway == "HALLMARK_ADIPOGENESIS" ~ "Adipocyte differentiation; may reflect tumour‑stroma interaction.",
+      Pathway == "HALLMARK_PEROXISOME" ~ "Lipid metabolism; altered in aggressive tumours.",
+      Pathway == "HALLMARK_ESTROGEN_RESPONSE_LATE" ~ "Hormone signalling; often relevant in breast/colon cancer.",
+      Pathway == "HALLMARK_MTORC1_SIGNALING" ~ "Nutrient sensing and growth; high activity linked to poor prognosis.",
+      Pathway == "HALLMARK_G2M_CHECKPOINT" ~ "Cell cycle control; high activity often indicates proliferation.",
+      Pathway == "HALLMARK_MITOTIC_SPINDLE" ~ "Mitotic progression; reflects proliferative capacity.",
+      Pathway == "HALLMARK_ANDROGEN_RESPONSE" ~ "Androgen signalling; relevant in ovarian and other cancers.",
+      Pathway == "HALLMARK_CHOLESTEROL_HOMEOSTASIS" ~ "Cholesterol metabolism; altered in cancer.",
+      Pathway == "HALLMARK_TNFA_SIGNALING_VIA_NFKB" ~ "Inflammatory/NF‑κB signalling; linked to progression.",
+      Pathway == "HALLMARK_PROTEIN_SECRETION" ~ "Secretory pathway; increased in aggressive tumours.",
+      Pathway == "HALLMARK_UV_RESPONSE_DN" ~ "DNA damage response; down‑regulated in some tumours.",
+      TRUE ~ "Review pathway definition."
+    )
+  ) %>%
+  select(Cancer, Embedding_Feature, LogHR, Pathway, Correlation, Direction)
+
+
+
+library(kableExtra)
+final_table_with_links %>%
+  kbl(
+    caption = "Top survival‑associated embeddings and their pathway correlations",
+    digits = 3,
+    escape = FALSE
+  ) %>%
+  kable_classic(full_width = FALSE)
+
+```
 
