@@ -24,6 +24,7 @@ library(patchwork)
 library(survival)
 library(ggrepel)
 library(gridExtra)
+library(kableExtra)
 ```
 
 
@@ -170,6 +171,7 @@ get_aligned_embedding_metadata <- function(mae_emb) {
 
 ```
 
+## Linked Embeddings
 
 ```{r}
 # linkTCGA will match patients based on TCGA barcodes and keep only those
@@ -949,7 +951,7 @@ pathway_coad <- get_gsva_pathway(
 # LUAD
 pathway_luad <- get_gsva_pathway(
   mae_emb = lung_mae_emb,
-  rna_assay_name = "LUAD_RNASeq2Gene-20160128",
+  rna_assay_name = "LUAD_RNASeq2GeneNorm-20160128",
   aligned_list = lung,
   res = lung_surv,  
   top_n = 30,
