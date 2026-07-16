@@ -1,5 +1,5 @@
 ---
-title: "embed_analysis"
+title: "Analysis of ProvGigaPath Embeddings"
 format: html
 editor: visual
 ---
@@ -7,6 +7,7 @@ editor: visual
 ## Libraries
 
 ```{r, message=FALSE}
+#| output: False
 library(rmarkdown)
 library(knitr)
 library(psych)
@@ -28,7 +29,7 @@ library(kableExtra)
 ```
 
 
-# Load slide data catalog (Kidney Renal Cancer)
+# Load slide data catalog
 
 ```{r load embeddings}
 # Kidney
@@ -541,7 +542,7 @@ coeff_matrix <- matrix(NA, nrow = length(all_features), ncol = 3,
 coeff_matrix[kirc_res$Feature, "KIRC"] <- kirc_res$Coefficient
 coeff_matrix[coad_res$Feature, "COAD"] <- coad_res$Coefficient
 coeff_matrix[lung_res$Feature, "LUAD"] <- lung_res$Coefficient
-lung_res
+
 # Remove rows that are all NA (should not happen, but safe)
 coeff_matrix <- coeff_matrix[!apply(is.na(coeff_matrix), 1, all), ]
 
