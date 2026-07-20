@@ -26,6 +26,8 @@ library(survival)
 library(ggrepel)
 library(gridExtra)
 library(kableExtra)
+library(survminer)
+
 ```
 
 
@@ -645,44 +647,52 @@ get_survival_coefficients <- function(embed_mat, meta_sub, time_col = "time",
   # meta_sub: data frame with patient metadata (must contain time and event columns)
   # time_col: column name for survival time (days)
   # event_col: column name for event (1 = death, 0 = censored)
-  
   # Align patients
   common <- intersect(rownames(embed_mat), rownames(meta_sub))
   embed <- embed_mat[common, ]
   meta <- meta_sub[common, ]
   
-  # Extract time and event
   time <- meta[[time_col]]
   event <- meta[[event_col]]
-  
-  # Remove patients with missing time or event
   valid <- complete.cases(time, event)
   embed <- embed[valid, ]
   time <- time[valid]
   event <- event[valid]
   
-  # Build survival object
   surv_obj <- Surv(time, event)
   
-  # Loop over each embedding feature
-  coeff <- numeric(ncol(embed))
+  # Initialize vectors
+  logHR <- numeric(ncol(embed))
+  HR <- numeric(ncol(embed))
+  CI_low <- numeric(ncol(embed))
+  CI_high <- numeric(ncol(embed))
   pval <- numeric(ncol(embed))
   
   for (i in 1:ncol(embed)) {
     fit <- coxph(surv_obj ~ embed[, i])
-    coeff[i] <- coef(fit)[1]           # log hazard ratio
-    pval[i] <- summary(fit)$coefficients[1, 5]  # p-value for the coefficient
+    logHR[i] <- coef(fit)[1]                     # log hazard ratio
+    HR[i] <- exp(logHR[i])                       # hazard ratio
+    ci <- exp(confint(fit))                      # 95% CI for HR
+    CI_low[i] <- ci[1, 1]
+    CI_high[i] <- ci[1, 2]
+    pval[i] <- summary(fit)$coefficients[1, 5]   # p‑value
   }
   
-  names(coeff) <- colnames(embed)
+  names(logHR) <- colnames(embed)
+  names(HR) <- colnames(embed)
+  names(CI_low) <- colnames(embed)
+  names(CI_high) <- colnames(embed)
   names(pval) <- colnames(embed)
   
   fdr <- p.adjust(pval, method = "fdr")
   sig <- which(fdr < fdr_thresh)
   
   data.frame(
-    Feature = names(coeff)[sig],
-    LogHR = coeff[sig],
+    Feature = names(logHR)[sig],
+    LogHR = logHR[sig],          # for heatmap (symmetric)
+    HR = HR[sig],                # for reporting
+    CI_low = CI_low[sig],
+    CI_high = CI_high[sig],
     P_value = pval[sig],
     FDR = fdr[sig],
     stringsAsFactors = FALSE
@@ -798,8 +808,90 @@ pheatmap(coeff_matrix,
 ```
 
 
+### KM plots
 
-# Compute pathway scores (GSVA) and correlate with embeddings
+```{r}
+
+# Pathological Stage KM
+
+
+# Pick your cancer (e.g., KIRC) and clinical variable (e.g., stage)
+meta <- kirc$meta  # change to coad$meta, lung$meta, ov$meta, read$meta
+variable <- "pathologic_stage"  # change to any column name in meta (e.g., "gender", "age_group")
+
+# Ensure time and event columns exist (they are already created in your prep)
+# Remove missing values for the chosen variable
+meta_clean <- meta[!is.na(meta$time) & !is.na(meta$event) & !is.na(meta[[variable]]), ]
+
+# Fit KM
+fit <- survfit(Surv(time, event) ~ get(variable), data = meta_clean)
+
+# Plot
+ggsurvplot(
+  fit,
+  data = meta_clean,
+  pval = TRUE,
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  palette = "Dark2",
+  title = paste("Overall Survival by", variable, "(KIRC)"),
+  xlab = "Time (days)",
+  ylab = "Survival Probability",
+  legend.title = variable
+)
+
+## Embedding Survival
+
+
+
+# Pick a significant embedding feature
+feature <- "slide_feat_144"
+
+# Extract as a matrix (1 column) to preserve row names
+embed_values <- kirc$embed[, feature, drop = FALSE]
+meta <- kirc$meta
+
+# Align patients (now rownames work)
+common <- intersect(rownames(embed_values), rownames(meta))
+embed_values <- embed_values[common, , drop = FALSE]
+meta <- meta[common, ]
+
+# Split into high vs low (median split)
+median_val <- median(embed_values[, 1], na.rm = TRUE)
+meta$embed_group <- ifelse(embed_values[, 1] > median_val, "High", "Low")
+meta$embed_group <- factor(meta$embed_group, levels = c("Low", "High"))
+
+# Remove missing time/event/group
+meta_clean <- meta[!is.na(meta$time) & !is.na(meta$event) & !is.na(meta$embed_group), ]
+
+# If still no patients, check counts
+cat("Patients after filtering:", nrow(meta_clean), "\n")
+
+if (nrow(meta_clean) > 0) {
+  fit <- survfit(Surv(time, event) ~ embed_group, data = meta_clean)
+  
+  ggsurvplot(
+    fit,
+    data = meta_clean,
+    pval = TRUE,
+    risk.table = TRUE,
+    risk.table.col = "strata",
+    palette = c("steelblue", "firebrick3"),
+    title = paste("Overall Survival by", feature, "(KIRC)"),
+    xlab = "Time (days)",
+    ylab = "Survival Probability",
+    legend.title = feature,
+    legend.labs = c("Low expression", "High expression")
+  )
+} else {
+  cat("No complete cases for this feature.\n")
+}
+
+```
+
+
+
+# Compute GSVA pathway scores and correlate with embeddings
 
 1. We build pathway_scores from the RNA‑seq data via GSVA – patients × pathways.
 
@@ -1075,13 +1167,13 @@ for (cancer in names(pathway_list)) {
   
   if (nrow(top_per_feature) > 0) {
     # Add LogHR from survival matrix
-    top_per_feature$LogHR <- sapply(top_per_feature$Embedding_Feature, function(f) {
-      if (f %in% rownames(coeff_matrix)) {
-        coeff_matrix[f, cancer]
-      } else {
-        NA
-      }
-    })
+    top_per_feature$HR <- sapply(top_per_feature$Embedding_Feature, function(f) {
+  if (f %in% rownames(coeff_matrix)) {
+    exp(coeff_matrix[f, cancer])   # exponentiate to get HR
+  } else {
+    NA
+  }
+})
     top_per_feature$Cancer <- cancer
     summary_list[[cancer]] <- top_per_feature
   }
@@ -1089,7 +1181,7 @@ for (cancer in names(pathway_list)) {
 
 # Combine and reorder columns
 final_table <- bind_rows(summary_list) %>%
-  select(Cancer, Embedding_Feature, LogHR, Pathway, Correlation, Direction)
+  select(Cancer, Embedding_Feature, HR, Pathway, Correlation, Direction)
 
 # Optional: filter to |Correlation| > 0.2
 final_table <- final_table %>% filter(abs(Correlation) > 0.2)
@@ -1105,21 +1197,29 @@ sign_embed_data <- final_table %>%
     Label = paste0(Embedding_Feature, "\n", Pathway)
   )
 
-# Scatter plot
-ggplot(sign_embed_data, aes(x = LogHR, y = Correlation, color = Cancer)) +
+
+# Better labeling for HR scatter plot
+ggplot(sign_embed_data, aes(x = HR, y = Correlation, color = Cancer)) +
   geom_point(size = 3, alpha = 0.8) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
   geom_text_repel(aes(label = Label), size = 3, max.overlaps = 15) +
+  scale_x_log10(
+    breaks = c(0.1, 0.2, 0.5, 1, 2, 5, 10),
+    labels = c("0.1", "0.2", "0.5", "1", "2", "5", "10")
+  ) +
   scale_color_brewer(palette = "Set1") +
   labs(
-    title = "Survival-associated embeddings and their pathway correlations",
-    x = "Log Hazard Ratio (survival)",
+    title = "Survival‑associated embeddings and their pathway correlations",
+    x = "Hazard Ratio (log scale)",
     y = "Spearman correlation with Hallmark pathway",
     color = "Cancer"
   ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
 ```
 
 
@@ -1151,7 +1251,7 @@ final_table_with_links <- final_table %>%
       TRUE ~ "Review pathway definition."
     )
   ) %>%
-  select(Cancer, Embedding_Feature, LogHR, Pathway, Correlation, Direction)
+  select(Cancer, Embedding_Feature, HR, Pathway, Correlation, Direction)
 
 
 
@@ -1164,6 +1264,9 @@ final_table_with_links %>%
   kable_classic(full_width = FALSE)
 
 ```
+
+
+
 
 
 
