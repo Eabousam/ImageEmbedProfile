@@ -27,7 +27,7 @@ library(ggrepel)
 library(gridExtra)
 library(kableExtra)
 library(survminer)
-
+library(tibble)
 ```
 
 
@@ -642,11 +642,14 @@ cat("READ: ", nrow(read$meta), " patients, events: ", sum(read$meta$event), "\n"
 
 ```{r}
 get_survival_coefficients <- function(embed_mat, meta_sub, time_col = "time", 
-                                      event_col = "event", fdr_thresh = 0.2) {
+                                      event_col = "event", fdr_thresh = 0.05,
+                                      standardize = TRUE) {
   # embed_mat: patients x features
   # meta_sub: data frame with patient metadata (must contain time and event columns)
   # time_col: column name for survival time (days)
   # event_col: column name for event (1 = death, 0 = censored)
+  # standardize: if TRUE, Z‑score each feature before Cox regression (HR per 1 SD)
+  
   # Align patients
   common <- intersect(rownames(embed_mat), rownames(meta_sub))
   embed <- embed_mat[common, ]
@@ -669,8 +672,17 @@ get_survival_coefficients <- function(embed_mat, meta_sub, time_col = "time",
   pval <- numeric(ncol(embed))
   
   for (i in 1:ncol(embed)) {
-    fit <- coxph(surv_obj ~ embed[, i])
-    logHR[i] <- coef(fit)[1]                     # log hazard ratio
+    # Extract feature values
+    x <- embed[, i]
+    
+    # Standardise (Z‑score) if requested
+    if (standardize) {
+      x <- scale(x, center = TRUE, scale = TRUE)
+      x <- as.numeric(x)  # scale() returns a matrix with attributes; convert to vector
+    }
+    
+    fit <- coxph(surv_obj ~ x)
+    logHR[i] <- coef(fit)[1]                     # log hazard ratio (per 1 SD if standardized)
     HR[i] <- exp(logHR[i])                       # hazard ratio
     ci <- exp(confint(fit))                      # 95% CI for HR
     CI_low[i] <- ci[1, 1]
@@ -684,7 +696,7 @@ get_survival_coefficients <- function(embed_mat, meta_sub, time_col = "time",
   names(CI_high) <- colnames(embed)
   names(pval) <- colnames(embed)
   
-  fdr <- p.adjust(pval, method = "fdr")
+  fdr <- p.adjust(pval, method = "BH")
   sig <- which(fdr < fdr_thresh)
   
   data.frame(
@@ -707,13 +719,13 @@ get_survival_coefficients <- function(embed_mat, meta_sub, time_col = "time",
 kirc_surv <- get_survival_coefficients(kirc$embed, kirc$meta,
                                        time_col = "time",
                                        event_col = "event",
-                                       fdr_thresh = 0.5)
+                                       fdr_thresh = 0.05)
 
 # For COAD
 coad_surv <- get_survival_coefficients(coad$embed, coad$meta,
                                        time_col = "time",
                                        event_col = "event",
-                                       fdr_thresh = 0.2)
+                                       fdr_thresh = 0.05)
 
 # For LUAD
 lung_surv <- get_survival_coefficients(lung$embed, lung$meta,
@@ -725,7 +737,7 @@ lung_surv <- get_survival_coefficients(lung$embed, lung$meta,
 ov_surv <- get_survival_coefficients(ov$embed, ov$meta,
                                        time_col = "time",
                                        event_col = "event",
-                                       fdr_thresh = 0.2)
+                                       fdr_thresh = 0.05)
 
 # For Read
 read_surv <- get_survival_coefficients(read$embed, read$meta,
@@ -845,7 +857,7 @@ ggsurvplot(
 
 
 # Pick a significant embedding feature
-feature <- "slide_feat_144"
+feature <- "slide_feat_17"
 
 # Extract as a matrix (1 column) to preserve row names
 embed_values <- kirc$embed[, feature, drop = FALSE]
@@ -877,16 +889,61 @@ if (nrow(meta_clean) > 0) {
     risk.table = TRUE,
     risk.table.col = "strata",
     palette = c("steelblue", "firebrick3"),
-    title = paste("Overall Survival by", feature, "(KIRC)"),
+    title = paste("Overall Survival by", feature, "(OV)"),
     xlab = "Time (days)",
     ylab = "Survival Probability",
     legend.title = feature,
-    legend.labs = c("Low expression", "High expression")
+    legend.labs = c("Low value", "High value")
   )
 } else {
   cat("No complete cases for this feature.\n")
 }
 
+```
+
+
+```{r}
+# Pick a significant embedding feature
+feature <- "slide_feat_17"
+
+# Extract values and align with metadata
+embed_values <- kirc$embed[, feature, drop = FALSE]
+meta <- kirc$meta
+common <- intersect(rownames(embed_values), rownames(meta))
+embed_values <- embed_values[common, , drop = FALSE]
+meta <- meta[common, ]
+
+# Create tertile groups
+meta$embed_group <- cut(embed_values[, 1],
+                        breaks = quantile(embed_values[, 1], probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                        include.lowest = TRUE,
+                        labels = c("Low", "Medium", "High"))
+
+# Remove missing time/event/group
+meta_clean <- meta[!is.na(meta$time) & !is.na(meta$event) & !is.na(meta$embed_group), ]
+
+cat("Patients after filtering:", nrow(meta_clean), "\n")
+
+if (nrow(meta_clean) > 0) {
+  fit <- survfit(Surv(time, event) ~ embed_group, data = meta_clean)
+  
+  ggsurvplot(
+    fit,
+    data = meta_clean,
+    pval = TRUE,
+    pval.method = TRUE,
+    risk.table = TRUE,
+    risk.table.col = "strata",
+    palette = c("steelblue", "forestgreen", "firebrick3"),
+    title = paste("Overall Survival by", feature, "(KIRC) – Tertiles"),
+    xlab = "Time (days)",
+    ylab = "Survival Probability",
+    legend.title = feature,
+    legend.labs = c("Low", "Medium", "High")
+  )
+} else {
+  cat("No complete cases for this feature.\n")
+}
 ```
 
 
@@ -1009,7 +1066,6 @@ get_gsva_pathway <- function(mae_emb, rna_assay_name, aligned_list, res,
 
 ```
 
-
 * Note here: For a given embedding feature (e.g., slide_feat_144) and a given pathway (e.g., HALLMARK_APICAL_JUNCTION), we compute the Spearman correlation between the vector of embedding values across patients and the vector of pathway scores across the same patients.
 
 
@@ -1025,7 +1081,7 @@ pathway_kirc <- get_gsva_pathway(
   rna_assay_name = "KIRC_RNASeq2GeneNorm-20160128",
   aligned_list = kirc,
   res = kirc_surv,  
-  top_n = 20,
+  top_n = 50,
   min_n = 30
 )
 
@@ -1036,7 +1092,7 @@ pathway_coad <- get_gsva_pathway(
   rna_assay_name = "COAD_RNASeq2GeneNorm-20160128",
   aligned_list = coad,
   res = coad_surv,
-  top_n = 30,
+  top_n = 50,
       min_n = 30
 
 )
@@ -1047,7 +1103,7 @@ pathway_luad <- get_gsva_pathway(
   rna_assay_name = "LUAD_RNASeq2GeneNorm-20160128",
   aligned_list = lung,
   res = lung_surv,  
-  top_n = 30,
+  top_n = 50,
   min_n = 30
 )
 
@@ -1058,7 +1114,7 @@ pathway_ov <- get_gsva_pathway(
   rna_assay_name = "OV_RNASeq2GeneNorm-20160128",
   aligned_list = ov,
   res = ov_surv,    
-  top_n = 30,
+  top_n = 50,
   min_n = 30
 )
 
@@ -1068,7 +1124,7 @@ pathway_read <- get_gsva_pathway(
   rna_assay_name = "READ_RNASeq2GeneNorm-20160128",
   aligned_list = read,
   res = read_surv, 
-  top_n = 30,
+  top_n = 50,
   min_n = 30
 )
 ```
@@ -1160,7 +1216,7 @@ for (cancer in names(pathway_list)) {
   # For each feature, pick the strongest association (highest |Correlation|)
   top_per_feature <- df %>%
     group_by(Embedding_Feature) %>%
-    slice_max(order_by = abs(Correlation), n = 1, with_ties = FALSE) %>%
+    slice_max(order_by = abs(Correlation), n = 2, with_ties = FALSE) %>%
     ungroup() %>%
     arrange(desc(abs(Correlation))) %>%
     slice_head(n = 5)   # keep top 5 features per cancer
@@ -1210,7 +1266,7 @@ ggplot(sign_embed_data, aes(x = HR, y = Correlation, color = Cancer)) +
   ) +
   scale_color_brewer(palette = "Set1") +
   labs(
-    title = "Survival‑associated embeddings and their pathway correlations",
+    title = "Survival-associated embeddings and their pathway correlations",
     x = "Hazard Ratio (log scale)",
     y = "Spearman correlation with Hallmark pathway",
     color = "Cancer"
@@ -1226,50 +1282,189 @@ ggplot(sign_embed_data, aes(x = HR, y = Correlation, color = Cancer)) +
 
 # Full Table
 
+
+* Survival‑associated embedding features and their top pathway correlations across five cancer types
+
+
+
+* This table lists all Prov‑GigaPath embedding features that were significantly associated with overall survival in at least one of the five cancer types (KIRC, COAD, LUAD, OV, READ). For each cancer‑feature pair, we report the hazard ratio (HR) with 95% confidence interval, raw p‑value, and FDR‑adjusted p‑value from univariate Cox proportional hazards regression. Embedding features were Z‑scored prior to regression, so HRs are interpretable as the change in hazard per 1 standard deviation increase in the embedding feature. For each feature, we also show the top two Hallmark pathways with the strongest Spearman correlation (|r| > 0.2), along with the correlation value and direction. 
+
+
+
 ```{r}
-# Assume final_table is your existing data frame
+# For KIRC – full (no filtering)
+kirc_surv_full <- get_survival_coefficients(kirc$embed, kirc$meta,
+                                            time_col = "time",
+                                            event_col = "event",
+                                            fdr_thresh = 1)
 
-final_table_with_links <- final_table %>%
-  mutate(
-    # Add clickable link
-    # Add a placeholder interpretation (you can replace these with your own text)
-    Interpretation = case_when(
-      Pathway == "HALLMARK_APICAL_JUNCTION" ~ "Cell–cell adhesion; may reflect epithelial disorganisation.",
-      Pathway == "HALLMARK_IL6_JAK_STAT3_SIGNALING" ~ "Inflammatory signalling; often pro‑tumorigenic.",
-      Pathway == "HALLMARK_HEME_METABOLISM" ~ "Erythroid/metabolic pathway; suggests metabolic reprogramming.",
-      Pathway == "HALLMARK_ADIPOGENESIS" ~ "Adipocyte differentiation; may reflect tumour‑stroma interaction.",
-      Pathway == "HALLMARK_PEROXISOME" ~ "Lipid metabolism; altered in aggressive tumours.",
-      Pathway == "HALLMARK_ESTROGEN_RESPONSE_LATE" ~ "Hormone signalling; often relevant in breast/colon cancer.",
-      Pathway == "HALLMARK_MTORC1_SIGNALING" ~ "Nutrient sensing and growth; high activity linked to poor prognosis.",
-      Pathway == "HALLMARK_G2M_CHECKPOINT" ~ "Cell cycle control; high activity often indicates proliferation.",
-      Pathway == "HALLMARK_MITOTIC_SPINDLE" ~ "Mitotic progression; reflects proliferative capacity.",
-      Pathway == "HALLMARK_ANDROGEN_RESPONSE" ~ "Androgen signalling; relevant in ovarian and other cancers.",
-      Pathway == "HALLMARK_CHOLESTEROL_HOMEOSTASIS" ~ "Cholesterol metabolism; altered in cancer.",
-      Pathway == "HALLMARK_TNFA_SIGNALING_VIA_NFKB" ~ "Inflammatory/NF‑κB signalling; linked to progression.",
-      Pathway == "HALLMARK_PROTEIN_SECRETION" ~ "Secretory pathway; increased in aggressive tumours.",
-      Pathway == "HALLMARK_UV_RESPONSE_DN" ~ "DNA damage response; down‑regulated in some tumours.",
-      TRUE ~ "Review pathway definition."
-    )
-  ) %>%
-  select(Cancer, Embedding_Feature, HR, Pathway, Correlation, Direction)
+# For COAD – full
+coad_surv_full <- get_survival_coefficients(coad$embed, coad$meta,
+                                            time_col = "time",
+                                            event_col = "event",
+                                            fdr_thresh = 1)
 
+# For LUAD – full
+lung_surv_full <- get_survival_coefficients(lung$embed, lung$meta,
+                                            time_col = "time",
+                                            event_col = "event",
+                                            fdr_thresh = 1)
 
+# For OV – full
+ov_surv_full <- get_survival_coefficients(ov$embed, ov$meta,
+                                          time_col = "time",
+                                          event_col = "event",
+                                          fdr_thresh = 1)
 
-final_table_with_links %>%
-  kbl(
-    caption = "Top survival‑associated embeddings and their pathway correlations",
-    digits = 3,
-    escape = FALSE
-  ) %>%
-  kable_classic(full_width = FALSE)
+# For READ – full
+read_surv_full <- get_survival_coefficients(read$embed, read$meta,
+                                            time_col = "time",
+                                            event_col = "event",
+                                            fdr_thresh = 1)
 
+# Add cancer labels
+kirc_surv_full$Cancer <- "KIRC"
+coad_surv_full$Cancer <- "COAD"
+lung_surv_full$Cancer <- "LUAD"
+ov_surv_full$Cancer <- "OV"
+read_surv_full$Cancer <- "READ"
 ```
 
 
+```{r}
+# ---- 1. Combine all full survival results ----
+surv_all_full <- bind_rows(kirc_surv_full, coad_surv_full, lung_surv_full,
+                           ov_surv_full, read_surv_full)
+
+# ---- 2. Combine all pathway results into one data frame ----
+all_pathways <- bind_rows(
+  pathway_kirc %>% mutate(Cancer = "KIRC"),
+  pathway_coad %>% mutate(Cancer = "COAD"),
+  pathway_luad %>% mutate(Cancer = "LUAD"),
+  pathway_ov %>% mutate(Cancer = "OV"),
+  pathway_read %>% mutate(Cancer = "READ")
+)
+
+# ---- 3. Build master table starting from survival results ----
+master_table_full <- surv_all_full %>%
+  left_join(all_pathways, by = c("Feature" = "Embedding_Feature", "Cancer" = "Cancer")) %>%
+  # For each feature per cancer, keep top 2 pathways by |Correlation|
+  group_by(Cancer, Feature) %>%
+  slice_max(order_by = abs(Correlation), n = 2, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(Cancer, Embedding_Feature = Feature, HR, CI_low, CI_high, P_value, FDR,
+         Pathway, Correlation, Direction) %>%
+  arrange(Cancer, desc(abs(Correlation)))
+
+# ---- 4. Display ----
+master_table_full %>%
+  kbl(
+    caption = "Supp. Table 1. ALL embedding features with survival associations and top GSVA pathway correlations",
+    digits = 3,
+    escape = FALSE
+  ) %>%
+  kable_classic(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  add_header_above(c(" " = 1, " " = 1, "Hazard Ratio" = 3, "Significance" = 2, "Pathway Correlation" = 3))
+
+# ---- 5. Export ----
+writexl::write_xlsx(master_table_full, "Main_Table_All_Embeddings.xlsx")
+
+```
+
+* Replicated survival‑associated embedding features across two or more cancer types with pathway correlations
 
 
+This table highlights Prov‑GigaPath embedding features that were significantly associated with overall survival (FDR < per‑cancer threshold) in at least two of the five cancer types. For each replicated feature, we report the number of cancers in which it was significant, the list of those cancers, the range of HRs across those cancers
 
+```{r}
 
+# Rerun LUAD with strict FDR < 0.05
+lung_surv_sig <- get_survival_coefficients(lung$embed, lung$meta,
+                                       time_col = "time",
+                                       event_col = "event",
+                                       fdr_thresh = 0.05)
 
+# Rerun READ with strict FDR < 0.05
+read_surv_sig <- get_survival_coefficients(read$embed, read$meta,
+                                       time_col = "time",
+                                       event_col = "event",
+                                       fdr_thresh = 0.05)
 
+# Then rebuild all_surv and proceed with the replication code
+# ---- 1. Build coefficient matrix using ALL significant features ----
+all_surv <- list(KIRC = kirc_surv, COAD = coad_surv, LUAD = lung_surv_sig, OV = ov_surv, READ = read_surv_sig)
+all_features <- unique(unlist(lapply(all_surv, function(df) df$Feature)))
+
+coeff_matrix <- matrix(NA, nrow = length(all_features), ncol = length(all_surv),
+                       dimnames = list(all_features, names(all_surv)))
+
+for (cancer in names(all_surv)) {
+  df <- all_surv[[cancer]]
+  common <- intersect(df$Feature, rownames(coeff_matrix))
+  if (length(common) > 0) {
+    coeff_matrix[common, cancer] <- df$LogHR[match(common, df$Feature)]
+  }
+}
+coeff_matrix <- coeff_matrix[!apply(is.na(coeff_matrix), 1, all), ]
+# Order by mean LogHR (positive to negative)
+mean_coef <- rowMeans(coeff_matrix, na.rm = TRUE)
+coeff_matrix <- coeff_matrix[order(mean_coef, decreasing = TRUE), ]
+
+# ---- 2. Survival replication (features in ≥2 cancers) ----
+surv_long <- as.data.frame(coeff_matrix) %>%
+  rownames_to_column("Feature") %>%
+  pivot_longer(cols = -Feature, names_to = "Cancer", values_to = "LogHR") %>%
+  filter(!is.na(LogHR)) %>%
+  mutate(HR = exp(LogHR))
+
+replication_surv <- surv_long %>%
+  group_by(Feature) %>%
+  summarise(
+    N_cancers = n_distinct(Cancer),
+    Cancers = paste(unique(Cancer), collapse = ", "),
+    HR_range = paste(round(range(HR, na.rm = TRUE), 2), collapse = " – "),
+    HR_direction = ifelse(all(HR > 1, na.rm = TRUE), "All > 1",
+                   ifelse(all(HR < 1, na.rm = TRUE), "All < 1", "Mixed")),
+    .groups = "drop"
+  ) %>%
+  filter(N_cancers >= 2)
+
+# ---- 3. Pathway details from final_table ----
+pathway_details <- final_table %>%
+  select(Embedding_Feature, Cancer, Pathway, Correlation) %>%
+  mutate(Detail = paste0(Cancer, ": ", Pathway, " (", round(Correlation, 2), ")")) %>%
+  group_by(Embedding_Feature) %>%
+  summarise(Pathway_Details = paste(Detail, collapse = "; "), .groups = "drop") %>%
+  rename(Feature = Embedding_Feature)
+
+# ---- 4. Shared pathways flag ----
+shared_flag <- final_table %>%
+  select(Embedding_Feature, Cancer, Pathway) %>%
+  group_by(Embedding_Feature, Pathway) %>%
+  summarise(N_cancers_with_pathway = n_distinct(Cancer), .groups = "drop") %>%
+  filter(N_cancers_with_pathway >= 2) %>%
+  group_by(Embedding_Feature) %>%
+  summarise(Shared_Pathways = paste(unique(Pathway), collapse = "; "), .groups = "drop") %>%
+  rename(Feature = Embedding_Feature)
+
+# ---- 5. Join and filter to features with pathway info ----
+replicated_with_pathways <- replication_surv %>%
+  left_join(pathway_details, by = "Feature") %>%
+  left_join(shared_flag, by = "Feature") %>%
+  filter(!is.na(Pathway_Details)) %>%
+  mutate(Shared_Pathways = ifelse(is.na(Shared_Pathways), "None", Shared_Pathways))
+
+# ---- 6. Display ----
+replicated_with_pathways %>%
+  select(Feature, N_cancers, Cancers, HR_range, HR_direction,
+         Shared_Pathways, Pathway_Details) %>%
+  kbl(
+    caption = "Replicated survival‑associated embeddings (significant in ≥2 cancers) and pathway correlations",
+    digits = 3,
+    escape = FALSE
+  ) %>%
+  kable_classic(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
 
