@@ -1,0 +1,511 @@
+---
+title: "02 - Batch Assessment and Correction"
+subtitle: "Tissue source site effects in Prov-GigaPath embeddings"
+format: html
+editor: visual
+---
+
+Assesses and corrects tissue source site (TSS) batch effects in the slide
+embeddings. TSS is nested within cancer type, so a pooled cross-cancer
+correction cannot separate site from cancer biology. Correction is therefore
+applied **within each cancer type**, and ComBat is compared with limma.
+
+Inputs: `embed_raw_by_cancer.rds`, `meta_by_cancer.rds` (from 01)
+
+Outputs: `embed_corrected_by_cancer.rds` (ComBat, used in 03 to 05),
+`meta_corrected_by_cancer.rds` (adds `TSS.Grouped`),
+`correction_diagnostics.rds`, figures in `figures/`
+
+| Output | Content |
+|---|---|
+| Table 2.1 | Site is nested within cancer type |
+| Table 2.2 | Site variance before and after correction, ComBat vs limma (main result) |
+| Figure 2.1 | t-SNE before and after ComBat |
+| Table S2.1 | Pooled correction removes cancer-type signal |
+| Table S2.2 | Within-cancer site effects, all TCGA cancers |
+| Table S2.3 | Sensitivity to the minimum site size |
+
+## Libraries
+
+```{r libraries, message=FALSE}
+#| output: false
+library(sva)        # ComBat
+library(limma)      # removeBatchEffect (comparison method)
+library(vegan)      # adonis2 (PERMANOVA)
+library(vcd)        # assocstats (Cramer's V)
+library(dplyr)      # data wrangling
+library(ggplot2)    # figures
+library(patchwork)  # combining panels
+library(Rtsne)      # t-SNE
+library(gt)         # tables
+```
+
+## Load data
+
+```{r load}
+data_dir <- "data"
+fig_dir  <- "figures"
+dir.create(fig_dir, showWarnings = FALSE)
+
+embed_raw_by_cancer <- readRDS(file.path(data_dir, "embed_raw_by_cancer.rds"))  # patients x 768 per cancer
+meta_by_cancer      <- readRDS(file.path(data_dir, "meta_by_cancer.rds"))       # metadata with TSS.Code
+
+main_cancers <- c("KIRC", "COAD", "LUAD", "OV", "READ")  # carried forward to 03 to 05
+all_cancers  <- names(embed_raw_by_cancer)               # used for supplementary tables
+
+min_site_n <- 5      # sites with fewer patients are pooled into "other" before correction
+set.seed(42)
+```
+
+## Helper functions
+
+```{r helpers}
+# Pool selected cancers into one matrix plus slim metadata (Patient, Cancer, TSS)
+pool_cancers <- function(embed_list, meta_list, cancers) {
+  embed_list <- embed_list[cancers]
+  meta_list  <- meta_list[cancers]
+
+  feats <- Reduce(intersect, lapply(embed_list, colnames))       # shared dimensions
+  embed <- do.call(rbind, lapply(embed_list, function(m) m[, feats, drop = FALSE]))
+
+  meta <- bind_rows(lapply(meta_list, function(m)
+    data.frame(Patient = m$Patient, Cancer = m$Cancer,
+               TSS.Code = m$TSS.Code, stringsAsFactors = FALSE)))
+  rownames(meta) <- meta$Patient
+
+  common <- intersect(rownames(embed), rownames(meta))           # align patients
+  embed  <- embed[common, , drop = FALSE]
+  meta   <- meta[common, , drop = FALSE]
+
+  keep  <- complete.cases(meta$Cancer, meta$TSS.Code)            # guard against missing labels
+  embed <- embed[keep, , drop = FALSE]
+  meta  <- meta[keep, , drop = FALSE]
+
+  meta$Cancer   <- droplevels(as.factor(meta$Cancer))
+  meta$TSS.Code <- droplevels(as.factor(meta$TSS.Code))
+  list(embed = embed, meta = meta)
+}
+
+# Pool sites with fewer than min_n patients into one "other" batch
+collapse_sites <- function(meta, min_n) {
+  tbl   <- table(meta$TSS.Code)                                  # patients per site
+  small <- names(tbl[tbl < min_n])
+  grp   <- as.character(meta$TSS.Code)
+  grp[meta$TSS.Code %in% small] <- "other"
+  droplevels(as.factor(grp))
+}
+
+# Standardise columns; constant columns would give NaN distances, so drop them
+safe_scale <- function(mat) {
+  sds  <- apply(mat, 2, sd, na.rm = TRUE)
+  keep <- sds > 0 & !is.na(sds)
+  if (sum(keep) < 2) return(NULL)
+  scale(mat[, keep, drop = FALSE], center = TRUE, scale = TRUE)
+}
+
+# Total variance summed over all dimensions (unscaled)
+total_var <- function(mat) sum(apply(mat, 2, var, na.rm = TRUE))
+```
+
+# Part A. Why correction must be done within cancer type
+
+## Table 2.1 Nesting of site within cancer type
+
+**Purpose:** shows that site and cancer type are confounded in TCGA.
+**How to read:** a Cramer's V close to 1, with nearly all sites contributing
+to a single cancer, means a pooled model cannot tell a site effect from a
+cancer effect. All correction and testing is therefore done within each cancer.
+
+```{r table2_1}
+check_nesting <- function(cancers, label) {
+  pooled <- pool_cancers(embed_raw_by_cancer, meta_by_cancer, cancers)
+  tab    <- table(pooled$meta$TSS.Code, pooled$meta$Cancer)      # sites x cancers
+
+  n_cancers_per_site <- apply(tab, 1, function(r) sum(r > 0))    # cancers each site contributes to
+  cramer <- assocstats(table(pooled$meta$Cancer, pooled$meta$TSS.Code))$cramer
+
+  data.frame(Cohort    = label,
+             Patients  = nrow(pooled$meta),
+             Sites     = nlevels(pooled$meta$TSS.Code),
+             Pct_single_cancer_sites = round(100 * mean(n_cancers_per_site == 1), 1),
+             Cramers_V = round(cramer, 3))                       # 1 = complete confounding
+}
+
+nesting_summary <- bind_rows(check_nesting(main_cancers, "Main 5 cancers"),
+                             check_nesting(all_cancers,  "All cancers"))
+
+nesting_summary %>%
+  gt() %>%
+  tab_header(title = "Table 2.1 Tissue source site is nested within cancer type",
+             subtitle = "Cramer's V of 1 indicates complete confounding") %>%
+  cols_label(Pct_single_cancer_sites = "% sites in one cancer only", Cramers_V = "Cramer's V") %>%
+  tab_options(table.font.size = 12, heading.align = "center")
+```
+
+## Pooled correction cannot protect cancer type
+
+ComBat checks whether the covariate to protect (Cancer) is a combination of
+the batch indicators. Because each site belongs to one cancer it is, so ComBat
+rejects the model. **This error is the expected result.**
+
+```{r pooled_fail}
+pooled         <- pool_cancers(embed_raw_by_cancer, meta_by_cancer, main_cancers)
+embed_t_pooled <- t(pooled$embed)                                # ComBat wants features x samples
+design_cancer  <- model.matrix(~ Cancer, data = pooled$meta)     # Cancer as protected covariate
+
+combat_protected <- tryCatch(
+  ComBat(dat = embed_t_pooled, batch = pooled$meta$TSS.Code,
+         mod = design_cancer, par.prior = TRUE, prior.plots = FALSE),
+  error = function(e) {
+    cat("ComBat rejected the Cancer-protected model:\n  ", conditionMessage(e), "\n"); NULL })
+```
+
+## Table S2.1 Pooled correction removes cancer-type signal
+
+**Purpose:** shows what happens if the data are corrected in a pooled model anyway.
+**How to read:** the only pooled model ComBat accepts does not protect Cancer,
+so removing site means also removes cancer means. R2 Cancer should collapse
+after pooled ComBat: the pooled approach erases real biology. In the Original
+row, R2 TSS (entered after Cancer) is the site variance within cancer, which
+Part B removes.
+
+```{r tableS2_1}
+combat_pooled <- ComBat(dat = embed_t_pooled, batch = pooled$meta$TSS.Code,
+                        mod = NULL, par.prior = TRUE, prior.plots = FALSE)
+
+pooled_mats <- list(Original = pooled$embed, `Pooled ComBat` = t(combat_pooled))
+
+set.seed(42)
+pooled_perm <- bind_rows(lapply(names(pooled_mats), function(nm) {
+  s <- safe_scale(pooled_mats[[nm]])                             # standardise dimensions
+  # Sequential terms with Cancer first: the TSS row is site variance within cancer
+  r <- adonis2(dist(s) ~ Cancer + TSS.Code, data = pooled$meta,
+               permutations = 999, by = "terms")
+  data.frame(Method    = nm,
+             R2_Cancer = r["Cancer", "R2"],   P_Cancer = r["Cancer", "Pr(>F)"],
+             R2_TSS    = r["TSS.Code", "R2"], P_TSS    = r["TSS.Code", "Pr(>F)"])
+}))
+
+pooled_perm %>%
+  gt() %>%
+  tab_header(title = "Table S2.1 Pooled correction removes cancer-type signal",
+             subtitle = "PERMANOVA on the 5 pooled cancers; TSS entered after Cancer") %>%
+  fmt_number(columns = starts_with("R2"), decimals = 3) %>%
+  fmt_number(columns = starts_with("P_"), decimals = 3) %>%
+  cols_label(R2_Cancer = "R2 Cancer", P_Cancer = "P Cancer",
+             R2_TSS = "R2 TSS within cancer", P_TSS = "P TSS") %>%
+  tab_options(table.font.size = 12, heading.align = "center")
+```
+
+# Part B. Within-cancer correction: ComBat versus limma
+
+Cancer is constant within each subset, so no covariate needs protecting
+(`mod = NULL`). Both methods remove site means. limma subtracts each observed
+site mean exactly, so its site R2 is ~0 by construction. ComBat shrinks site
+means towards the overall average (empirical Bayes), which matters when sites
+are small. Overcorrection is therefore judged by **variance retained**: how
+much of the original embedding variance survives correction.
+
+```{r correct_fn}
+correct_within_cancer <- function(cancer_label, embed_list, meta_list,
+                                  min_n = min_site_n, n_perm = 999) {
+
+  emb  <- embed_list[[cancer_label]]                             # patients x 768, raw
+  meta <- meta_list[[cancer_label]]                              # patient metadata
+
+  common <- intersect(rownames(emb), rownames(meta))             # align patients
+  emb    <- emb[common, , drop = FALSE]
+  meta   <- meta[common, , drop = FALSE]
+  keep   <- !is.na(meta$TSS.Code)                                # guard against missing site
+  emb    <- emb[keep, , drop = FALSE]
+  meta   <- meta[keep, , drop = FALSE]
+
+  meta$TSS.Code    <- droplevels(as.factor(meta$TSS.Code))       # every real site
+  meta$TSS.Grouped <- collapse_sites(meta, min_n)                # small sites pooled into "other"
+
+  if (nlevels(meta$TSS.Grouped) < 2 || nrow(emb) < 10) {         # nothing to correct
+    cat(cancer_label, ": insufficient site diversity or n, skipping\n")
+    return(NULL)
+  }
+
+  embed_t <- t(emb)                                              # features x patients
+  batch   <- meta$TSS.Grouped
+
+  # ComBat: empirical Bayes shrinkage of site means and variances
+  combat <- tryCatch(
+    ComBat(dat = embed_t, batch = batch, mod = NULL, par.prior = TRUE, prior.plots = FALSE),
+    error = function(e) { cat(cancer_label, "ComBat failed:", conditionMessage(e), "\n"); NULL })
+
+  # limma: exact subtraction of observed site means
+  lmm <- tryCatch(
+    removeBatchEffect(x = embed_t, batch = batch),
+    error = function(e) { cat(cancer_label, "limma failed:", conditionMessage(e), "\n"); NULL })
+
+  if (is.null(combat) || is.null(lmm)) return(NULL)
+
+  emb_combat <- t(combat); rownames(emb_combat) <- rownames(emb) # back to patients x features
+  emb_limma  <- t(lmm);    rownames(emb_limma)  <- rownames(emb)
+
+  # Standardised versions for the PERMANOVA distances
+  s_orig   <- safe_scale(emb)
+  s_combat <- safe_scale(emb_combat)
+  s_limma  <- safe_scale(emb_limma)
+  if (is.null(s_orig) || is.null(s_combat) || is.null(s_limma)) {
+    cat(cancer_label, ": no usable variance after filtering, skipping\n")
+    return(NULL)
+  }
+
+  # PERMANOVA of site; resetting the seed gives identical permutations for each version
+  set.seed(42)
+  r_orig   <- adonis2(dist(s_orig)   ~ TSS.Grouped, data = meta, permutations = n_perm, by = "terms")
+  set.seed(42)
+  r_combat <- adonis2(dist(s_combat) ~ TSS.Grouped, data = meta, permutations = n_perm, by = "terms")
+  set.seed(42)
+  r_limma  <- adonis2(dist(s_limma)  ~ TSS.Grouped, data = meta, permutations = n_perm, by = "terms")
+
+  v0     <- total_var(emb)                                       # raw variance (denominator)
+  n_site <- table(meta$TSS.Code)                                 # patients per real site
+
+  diagnostics <- data.frame(
+    Cancer          = cancer_label,
+    n_patients      = nrow(emb),
+    n_sites_raw     = length(n_site),                            # real sites
+    n_sites_small   = sum(n_site < min_n),                       # sites pooled into "other"
+    n_sites_used    = nlevels(batch),                            # batches passed to ComBat/limma
+    mean_only       = any(table(batch) == 1),                    # ComBat goes mean-only if a batch has n = 1
+    R2_null         = (nlevels(batch) - 1) / (nrow(emb) - 1),    # expected site R2 with no site effect
+    R2_TSS_orig     = r_orig["TSS.Grouped", "R2"],
+    P_TSS_orig      = r_orig["TSS.Grouped", "Pr(>F)"],
+    R2_TSS_combat   = r_combat["TSS.Grouped", "R2"],
+    P_TSS_combat    = r_combat["TSS.Grouped", "Pr(>F)"],
+    R2_TSS_limma    = r_limma["TSS.Grouped", "R2"],
+    Var_kept_combat = total_var(emb_combat) / v0,                # share of raw variance retained
+    Var_kept_limma  = total_var(emb_limma)  / v0)
+
+  list(embed_combat = emb_combat, embed_limma = emb_limma,
+       embed_raw = emb, meta = meta, diagnostics = diagnostics)
+}
+```
+
+```{r run_correction}
+# Every cancer is corrected for Table S2.2; the main 5 are carried forward
+correction_all <- list()
+for (cc in all_cancers) {
+  cat("Correcting", cc, "\n")
+  res <- tryCatch(correct_within_cancer(cc, embed_raw_by_cancer, meta_by_cancer),
+                  error = function(e) { cat("  failed:", conditionMessage(e), "\n"); NULL })
+  if (!is.null(res)) correction_all[[cc]] <- res
+}
+
+diag_all        <- bind_rows(lapply(correction_all, `[[`, "diagnostics"))          # all cancers
+correction_list <- correction_all[intersect(main_cancers, names(correction_all))]  # main cohort
+correction_diag <- filter(diag_all, Cancer %in% main_cancers)                      # Table 2.2
+
+cat("Corrected:", length(correction_all), "cancers; main cohort:",
+    paste(names(correction_list), collapse = ", "), "\n")
+```
+
+## Table 2.2 Site variance before and after correction
+
+**Purpose:** the main batch-effect result, one row per cancer.
+**How to read, in three steps:**
+
+1. Raw R2 well above the null expectation, with a small P, means site effects
+   are present within each cancer.
+2. ComBat R2 near the null means ComBat removed them.
+3. limma retaining less variance than ComBat, especially where many sites are
+   small, means limma removes patient signal along with the site means
+   (overcorrection).
+
+```{r table2_2}
+correction_diag %>%
+  select(Cancer, n_patients, n_sites_raw, n_sites_small, R2_null,
+         R2_TSS_orig, P_TSS_orig, R2_TSS_combat, P_TSS_combat, R2_TSS_limma,
+         Var_kept_combat, Var_kept_limma) %>%
+  gt() %>%
+  tab_header(title = "Table 2.2 Tissue source site variance before and after within-cancer correction",
+             subtitle = paste0("PERMANOVA within each cancer; sites with n < ", min_site_n, " pooled")) %>%
+  tab_spanner(label = "Sites", columns = c(n_sites_raw, n_sites_small)) %>%
+  tab_spanner(label = "Site R2 (PERMANOVA)",
+              columns = c(R2_null, R2_TSS_orig, P_TSS_orig, R2_TSS_combat, P_TSS_combat, R2_TSS_limma)) %>%
+  tab_spanner(label = "Variance retained", columns = c(Var_kept_combat, Var_kept_limma)) %>%
+  fmt_number(columns = starts_with("R2"), decimals = 3) %>%
+  fmt_number(columns = starts_with("P_"), decimals = 3) %>%
+  fmt_percent(columns = starts_with("Var_kept"), decimals = 1) %>%
+  cols_label(n_patients = "Patients", n_sites_raw = "Total", n_sites_small = paste0("n < ", min_site_n),
+             R2_null = "Expected (null)", R2_TSS_orig = "Raw", P_TSS_orig = "P",
+             R2_TSS_combat = "ComBat", P_TSS_combat = "P", R2_TSS_limma = "limma",
+             Var_kept_combat = "ComBat", Var_kept_limma = "limma") %>%
+  tab_footnote(paste("Expected (null) = (sites - 1) / (patients - 1), the R2 expected with no site effect.",
+                     "limma removes site means exactly, so its R2 is ~0 by construction;",
+                     "overcorrection is judged by variance retained.")) %>%
+  tab_options(table.font.size = 12, heading.align = "center")
+```
+
+## Figure 2.1 Embeddings before and after correction
+
+**Purpose:** the visual counterpart of Table 2.2. **How to read:** colour is
+cancer type, shape marks the three largest sites within each cancer. In Raw,
+points of the same colour and shape bunch together inside their cancer's
+cluster: that is the site effect. After ComBat, the shapes should be mixed
+within each cluster, while the cancer clusters themselves stay separate,
+because correction never crosses cancer types.
+
+```{r fig2_1, fig.width=11, fig.height=5.5}
+feats <- Reduce(intersect, lapply(correction_list, function(x) colnames(x$embed_raw)))  # shared dims
+
+# Stack the per-cancer matrices; list order matches meta_stack below
+stack_version <- function(slot)
+  do.call(rbind, lapply(correction_list, function(x) x[[slot]][, feats, drop = FALSE]))
+
+meta_stack <- bind_rows(lapply(correction_list, function(x)
+  data.frame(Patient = rownames(x$meta), Cancer = x$meta$Cancer,
+             TSS = as.character(x$meta$TSS.Grouped), stringsAsFactors = FALSE)))
+
+versions <- list(`Raw embedding`    = stack_version("embed_raw"),
+                 `ComBat-corrected` = stack_version("embed_combat"))
+
+tsne_df <- bind_rows(lapply(names(versions), function(nm) {
+  set.seed(42)                                                   # same seed for both versions
+  ts <- Rtsne(as.matrix(versions[[nm]]), dims = 2, perplexity = 30,
+              check_duplicates = FALSE, pca = TRUE)
+  data.frame(TSNE1 = ts$Y[, 1], TSNE2 = ts$Y[, 2],
+             Cancer = meta_stack$Cancer, TSS = meta_stack$TSS,
+             Version = factor(nm, levels = names(versions)))
+}))
+
+# Sites are nested in cancers, so shapes are assigned within each cancer:
+# the three largest real sites per cancer get a shape, the rest share one
+rank_lab <- c("Largest site", "2nd largest", "3rd largest")
+site_rank <- meta_stack %>%
+  filter(TSS != "other") %>%                                     # pooled small sites are not one site
+  dplyr::count(Cancer, TSS) %>%
+  group_by(Cancer) %>%
+  slice_max(n, n = 3, with_ties = FALSE) %>%                     # sorted largest first
+  mutate(Site_rank = rank_lab[row_number()]) %>%
+  ungroup() %>%
+  select(Cancer, TSS, Site_rank)
+
+tsne_df <- tsne_df %>%
+  left_join(site_rank, by = c("Cancer", "TSS")) %>%
+  mutate(Site_rank = factor(ifelse(is.na(Site_rank), "Other sites", Site_rank),
+                            levels = c(rank_lab, "Other sites")),
+         Cancer    = factor(Cancer, levels = main_cancers))
+tsne_df <- tsne_df[order(tsne_df$Site_rank != "Other sites"), ]  # other sites drawn first, underneath
+
+# Cancer colours: Dark2, the palette used for views in 05
+cancer_cols <- c(KIRC = "#1b9e77", COAD = "#d95f02", LUAD = "#7570b3",
+                 OV   = "#e7298a", READ = "#66a61e")
+
+others <- filter(tsne_df, Site_rank == "Other sites")                     # background layer
+tops   <- filter(tsne_df, Site_rank != "Other sites") %>%                 # foreground layer
+  mutate(Site_rank = droplevels(Site_rank))
+
+fig2_1 <- ggplot() +
+  geom_point(data = others, aes(TSNE1, TSNE2, colour = Cancer),
+             size = 0.6, alpha = 0.3, show.legend = FALSE) +
+  geom_point(data = tops, aes(TSNE1, TSNE2, fill = Cancer, shape = Site_rank),
+             size = 1.9, colour = "white", stroke = 0.2, alpha = 0.9) +   # white edge keeps points apart
+  facet_wrap(~ Version, nrow = 1, scales = "free") +
+  scale_colour_manual(values = cancer_cols, guide = "none") +
+  scale_fill_manual(values = cancer_cols, name = "Cancer type") +
+  scale_shape_manual(values = c(24, 22, 23), name = "Site (within cancer)") +   # fillable ▲ ■ ◆
+  guides(fill  = guide_legend(override.aes = list(shape = 21, size = 3.5)),
+         shape = guide_legend(override.aes = list(fill = "grey40", size = 3))) +
+  labs(title = "Figure 2.1 Prov-GigaPath embeddings before and after within-cancer ComBat",
+       subtitle = "Shapes: three largest sites within each cancer; small dots: all other sites",
+       x = "t-SNE 1", y = "t-SNE 2") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(),
+        strip.background = element_rect(fill = "grey95", colour = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom", legend.box = "horizontal")
+
+fig2_1
+ggsave(file.path(fig_dir, "Fig2_1_tSNE.pdf"), fig2_1, width = 11, height = 5.5)
+```
+
+
+
+
+## Table S2.2 Site effects across all TCGA cancer types
+
+**Purpose:** shows whether site effects are specific to the main five cancers
+or a general property of the embedding.
+**How to read:** count the cancers with raw P < 0.05. If most are significant,
+the site effect is pervasive, supporting correction in any use of these
+embeddings. The variance-retained columns show whether the limma gap holds
+across cancers.
+
+```{r tableS2_2}
+diag_all %>%
+  arrange(desc(R2_TSS_orig - R2_null)) %>%                       # largest excess site signal first
+  select(Cancer, n_patients, n_sites_raw, n_sites_small, R2_null, R2_TSS_orig, P_TSS_orig,
+         R2_TSS_combat, Var_kept_combat, Var_kept_limma) %>%
+  gt() %>%
+  tab_header(title = "Table S2.2 Within-cancer site effects across all TCGA cancer types",
+             subtitle = paste0("Sites with n < ", min_site_n, " pooled")) %>%
+  fmt_number(columns = starts_with("R2"), decimals = 3) %>%
+  fmt_number(columns = P_TSS_orig, decimals = 3) %>%
+  fmt_percent(columns = starts_with("Var_kept"), decimals = 1) %>%
+  cols_label(n_patients = "Patients", n_sites_raw = "Sites", n_sites_small = paste0("Sites n < ", min_site_n),
+             R2_null = "R2 null", R2_TSS_orig = "R2 raw", P_TSS_orig = "P raw",
+             R2_TSS_combat = "R2 ComBat", Var_kept_combat = "Var kept ComBat",
+             Var_kept_limma = "Var kept limma") %>%
+  tab_options(table.font.size = 11, heading.align = "center")
+```
+
+## Table S2.3 Sensitivity to the minimum site size
+
+**Purpose:** directly tests whether small sites drive limma's overcorrection.
+**How to read:** with no pooling ("n < 1", singleton sites kept), limma should
+retain much less variance than ComBat, because it sets every patient at a
+singleton site to the site mean. The gap should narrow as more small sites are
+pooled. ComBat should be stable across thresholds, supporting the choice of
+ComBat and of the 5-patient threshold.
+
+```{r tableS2_3}
+sens <- bind_rows(lapply(c(1, 3, 5, 10), function(mn) {
+  bind_rows(lapply(main_cancers, function(cc) {
+    r <- correct_within_cancer(cc, embed_raw_by_cancer, meta_by_cancer,
+                               min_n = mn, n_perm = 99)          # fewer permutations: R2 is unaffected
+    if (is.null(r)) return(NULL)
+    r$diagnostics %>%
+      mutate(Threshold = paste0("Sites with n < ", mn, " pooled")) %>%
+      select(Threshold, Cancer, n_sites_used, mean_only,
+             R2_TSS_orig, R2_TSS_combat, Var_kept_combat, Var_kept_limma)
+  }))
+}))
+
+sens %>%
+  gt(groupname_col = "Threshold") %>%
+  tab_header(title = "Table S2.3 Effect of the minimum site size threshold",
+             subtitle = "A larger gap in variance retained indicates limma overcorrection") %>%
+  fmt_number(columns = starts_with("R2"), decimals = 3) %>%
+  fmt_percent(columns = starts_with("Var_kept"), decimals = 1) %>%
+  cols_label(n_sites_used = "Batches", mean_only = "ComBat mean-only",
+             R2_TSS_orig = "R2 raw", R2_TSS_combat = "R2 ComBat",
+             Var_kept_combat = "Var kept ComBat", Var_kept_limma = "Var kept limma") %>%
+  tab_options(table.font.size = 11, heading.align = "center")
+```
+
+## Save corrected embeddings
+
+ComBat-corrected embeddings for the main cohort are carried forward to 03 to 05.
+The limma output is used only for the comparison above.
+
+```{r save}
+embed_corrected_by_cancer <- lapply(correction_list, `[[`, "embed_combat")  # patients x 768
+meta_corrected_by_cancer  <- lapply(correction_list, `[[`, "meta")          # includes TSS.Grouped
+
+saveRDS(embed_corrected_by_cancer, file.path(data_dir, "embed_corrected_by_cancer.rds"))
+saveRDS(meta_corrected_by_cancer,  file.path(data_dir, "meta_corrected_by_cancer.rds"))
+saveRDS(diag_all,                  file.path(data_dir, "correction_diagnostics.rds"))
+
+cat("Saved:", paste(names(embed_corrected_by_cancer), collapse = ", "), "|",
+    sum(sapply(embed_corrected_by_cancer, nrow)), "patients\n")
+```
+
+```{r session}
+sessionInfo()
+```

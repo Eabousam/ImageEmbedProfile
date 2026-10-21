@@ -1,0 +1,938 @@
+---
+title: "03 - Embedding Analysis"
+subtitle: "Survival and pathway associations in site-corrected embeddings"
+format: html
+editor: visual
+---
+
+Tests whether Prov-GigaPath embeddings carry prognostic and molecular signal
+after within-cancer site correction (02). Raw embeddings are analysed
+alongside corrected ones, so the effect of correction is visible.
+
+Inputs: `embed_corrected_by_cancer.rds`, `embed_raw_by_cancer.rds`,
+`meta_corrected_by_cancer.rds`, `omics_by_cancer.rds`
+
+Outputs: `surv_all.rds`, `gsva_scores_by_cancer.rds`, `clin_vars_by_cancer.rds`
+(all used in 05), `pathway_results.rds`, `cindex_summary.rds`,
+`oof_risk_scores.rds`, `Table3_1_full.xlsx`
+
+| Output |
+|---|---|
+| Figure 3.1 | Did site correction change which dimensions predict survival? |
+| Table 3.1 | Which prognostic dimensions track which Hallmark pathways? |
+| Table 3.2 | Does the slide alone predict survival at unseen sites, and how close to clinical variables? |
+| Table 3.3 | Does the slide add prognostic information beyond age, stage and grade? |
+| Figure 3.2 | What biology characterises patients the slide model calls high-risk? |
+| Tables S3.1 to S3.4, Figure S3.1 | Dimension counts, site signal, replication across cancers, random vs site-held-out folds |
+
+## Libraries
+
+```{r libraries, message=FALSE}
+#| output: false
+library(tidyr)       # pivot_longer / pivot_wider
+library(tibble)      # rownames_to_column
+library(survival)    # Surv, coxph, concordance
+library(glmnet)      # elastic-net Cox (4.1 or later, for Surv responses)
+library(GSVA)        # ssGSEA pathway scores
+library(msigdbr)     # Hallmark gene sets
+library(ggplot2)     # figures
+library(gt)          # tables
+library(writexl)     # Excel export of the full Table 3.1
+library(dplyr)       # loaded last so its verbs are not masked
+```
+
+## Load data
+
+```{r load}
+data_dir <- "data"
+
+embed_corrected_by_cancer <- readRDS(file.path(data_dir, "embed_corrected_by_cancer.rds"))
+embed_raw_by_cancer       <- readRDS(file.path(data_dir, "embed_raw_by_cancer.rds"))
+meta_corrected_by_cancer  <- readRDS(file.path(data_dir, "meta_corrected_by_cancer.rds"))
+omics_by_cancer           <- readRDS(file.path(data_dir, "omics_by_cancer.rds"))
+
+# Only cancers that were corrected in 02
+main_cancers <- intersect(c("KIRC", "COAD", "LUAD", "OV", "READ"), names(embed_corrected_by_cancer))
+cat("Analysing:", paste(main_cancers, collapse = ", "), "\n")
+
+embed_corrected <- embed_corrected_by_cancer[main_cancers]   # ComBat, patients x 768
+embed_raw       <- embed_raw_by_cancer[main_cancers]         # uncorrected, for comparison
+meta            <- meta_corrected_by_cancer[main_cancers]    # survival, TSS, clinical
+omics           <- omics_by_cancer[main_cancers]             # RNA-seq for GSVA
+
+fdr_thresh <- 0.05
+set.seed(42)
+```
+
+## Helper functions
+
+```{r helpers}
+# ---- General ----
+
+# Experiments are named like "KIRC_RNASeq2GeneNorm-20160128": match by pattern
+get_assay <- function(omics_list, pattern) {
+  if (is.null(omics_list)) return(NULL)
+  idx <- grep(pattern, names(omics_list), ignore.case = TRUE)
+  if (length(idx) == 0) return(NULL)
+  omics_list[[idx[1]]]
+}
+
+fmt_p <- function(p) ifelse(is.na(p), "-", ifelse(p < 0.001, "<0.001", sprintf("%.3f", p)))
+
+fmt_ci <- function(est, lo, hi, d = 3) {                     # "0.650 (0.600 to 0.700)"
+  f <- paste0("%.", d, "f (%.", d, "f to %.", d, "f)")
+  ifelse(is.na(est), NA_character_, sprintf(f, est, lo, hi))
+}
+
+# "HALLMARK_TNFA_SIGNALING_VIA_NFKB" -> "TNFA Signaling Via NFKB" (same function used in 05)
+clean_pw <- function(x) {
+  caps <- c("DNA", "UV", "MYC", "E2F", "G2M", "TNFA", "NFKB", "IL2", "STAT5", "IL6",
+            "JAK", "STAT3", "KRAS", "MTORC1", "PI3K", "AKT", "MTOR", "TGF", "WNT",
+            "P53", "UP", "DN", "V1", "V2")
+  words <- strsplit(gsub("_", " ", sub("^HALLMARK_", "", x)), " ")
+  vapply(words, function(w)
+    paste(ifelse(w %in% caps, w, paste0(substr(w, 1, 1), tolower(substring(w, 2)))),
+          collapse = " "), character(1))
+}
+
+# Two-sided P for a Spearman correlation (t approximation, the same as
+# cor.test(exact = FALSE) and as used in 05, so all pathway P-values match)
+spearman_p <- function(r, n) {
+  t <- r * sqrt((n - 2) / pmax(1 - r^2, 1e-12))
+  2 * pt(-abs(t), df = n - 2)
+}
+
+# Adjusted R2 of site for every embedding column at once (from group means)
+site_adj_r2 <- function(E, g) {
+  g   <- droplevels(as.factor(g))
+  n_g <- as.vector(table(g))                                 # patients per site
+  mu  <- colMeans(E)                                         # overall mean per dimension
+  M   <- rowsum(E, g) / n_g                                  # site means
+  ssb <- colSums(n_g * sweep(M, 2, mu)^2)                    # between-site sum of squares
+  sst <- colSums(sweep(E, 2, mu)^2)                          # total sum of squares
+  r2  <- ssb / sst
+  n <- nrow(E); k <- nlevels(g)
+  1 - (1 - r2) * (n - 1) / (n - k)                           # adjust for number of sites
+}
+
+# ---- Univariable Cox per embedding dimension ----
+# fdr_thresh = 1 returns every dimension that could be fitted
+get_survival_coefficients <- function(embed_mat, meta_df, time_col = "time",
+                                      event_col = "event", fdr_thresh = 0.05,
+                                      standardize = TRUE) {
+
+  common <- intersect(rownames(embed_mat), rownames(meta_df))    # align patients
+  embed  <- embed_mat[common, , drop = FALSE]
+  meta   <- meta_df[common, , drop = FALSE]
+
+  time  <- suppressWarnings(as.numeric(meta[[time_col]]))
+  event <- suppressWarnings(as.numeric(meta[[event_col]]))
+  valid <- complete.cases(time, event) & time > 0                # usable survival
+  embed <- embed[valid, , drop = FALSE]
+  time  <- time[valid]
+  event <- event[valid]
+
+  if (nrow(embed) < 10 || sum(event == 1) < 5) {                 # Cox not estimable
+    warning("Too few patients or events; skipping.")
+    return(NULL)
+  }
+
+  surv_obj <- Surv(time, event)
+  n <- ncol(embed)
+  logHR <- CI_low <- CI_high <- pval <- rep(NA_real_, n)
+
+  for (i in seq_len(n)) {
+    x <- embed[, i]
+    if (standardize) {                                           # HR per 1 SD
+      s <- sd(x, na.rm = TRUE)
+      if (is.na(s) || s == 0) next                               # constant dimension
+      x <- as.numeric(scale(x))
+    }
+    fit <- tryCatch(coxph(surv_obj ~ x), error = function(e) NULL)
+    if (is.null(fit)) next                                       # one bad fit does not stop the loop
+
+    logHR[i] <- coef(fit)[1]
+    ci <- suppressWarnings(try(exp(confint(fit)), silent = TRUE))
+    if (!inherits(ci, "try-error")) { CI_low[i] <- ci[1, 1]; CI_high[i] <- ci[1, 2] }
+    pval[i] <- summary(fit)$coefficients[1, 5]
+  }
+
+  ok  <- !is.na(pval)
+  fdr <- rep(NA_real_, n)
+  fdr[ok] <- p.adjust(pval[ok], method = "BH")                   # BH across dimensions
+
+  res <- data.frame(Feature = colnames(embed), LogHR = logHR, HR = exp(logHR),
+                    CI_low = CI_low, CI_high = CI_high, P_value = pval, FDR = fdr,
+                    stringsAsFactors = FALSE)
+  res[!is.na(res$FDR) & res$FDR <= fdr_thresh, , drop = FALSE]
+}
+
+# ---- GSVA Hallmark scores, correlated with every embedding dimension ----
+# No log transform: ssGSEA ranks genes within each sample, so the scores are
+# identical on the raw or log scale.
+get_gsva_pathway <- function(rna_mat, embed_mat, max_na_frac = 0.2) {
+
+  common <- intersect(colnames(rna_mat), rownames(embed_mat))    # patients with both
+  if (length(common) < 10) return(NULL)
+  rna   <- as.matrix(rna_mat[, common, drop = FALSE])
+  embed <- embed_mat[common, , drop = FALSE]
+
+  # Patients with no expression at all would inflate every gene's missingness
+  rna <- rna[, colMeans(is.na(rna)) < 1, drop = FALSE]
+  if (ncol(rna) < 10) { message("Only ", ncol(rna), " patients with expression data"); return(NULL) }
+
+  keep_g <- rowMeans(is.na(rna)) <= max_na_frac                  # drop mostly-missing genes
+  keep_g[is.na(keep_g)] <- FALSE
+  rna <- rna[keep_g, , drop = FALSE]
+  if (nrow(rna) == 0) { message("No genes below the missingness threshold"); return(NULL) }
+
+  keep_p <- colMeans(is.na(rna)) <= max_na_frac                  # drop mostly-missing patients
+  keep_p[is.na(keep_p)] <- FALSE
+  if (sum(keep_p) < 10) { message("Only ", sum(keep_p), " patients below the threshold"); return(NULL) }
+  rna <- rna[, keep_p, drop = FALSE]
+
+  # Impute scattered NAs with the gene median (one NA corrupts a patient's ranking)
+  if (anyNA(rna)) {
+    med <- apply(rna, 1, median, na.rm = TRUE)
+    idx <- which(is.na(rna), arr.ind = TRUE)
+    rna[idx] <- med[idx[, "row"]]
+    rna <- rna[!is.na(rowSums(rna)), , drop = FALSE]
+  }
+
+  gene_sd <- apply(rna, 1, sd)                                   # constant genes carry no rank information
+  rna <- rna[!is.na(gene_sd) & gene_sd > 0, , drop = FALSE]
+
+  embed <- embed[intersect(rownames(embed), colnames(rna)), , drop = FALSE]  # realign patients
+  rna   <- rna[, rownames(embed), drop = FALSE]
+  if (nrow(rna) < 500 || ncol(rna) < 10) {
+    message("Too few genes or patients: ", nrow(rna), " genes, ", ncol(rna), " patients"); return(NULL)
+  }
+  message("GSVA on ", nrow(rna), " genes x ", ncol(rna), " patients")
+
+  hallmark <- msigdbr(species = "Homo sapiens", collection = "H") %>% split(.$gs_name)
+  hallmark <- lapply(hallmark, function(x) unique(x$gene_symbol))   # pathway -> gene symbols
+
+  gsva_scores <- tryCatch({
+    param <- GSVA::ssgseaParam(exprData = rna, geneSets = hallmark)
+    GSVA::gsva(param, verbose = FALSE)
+  }, error = function(e) { message("GSVA failed: ", conditionMessage(e)); NULL })
+  if (is.null(gsva_scores)) return(NULL)
+
+  pathway_scores <- t(gsva_scores)                               # patients x pathways
+  common2 <- intersect(rownames(embed), rownames(pathway_scores))
+
+  cor_mat <- suppressWarnings(cor(embed[common2, , drop = FALSE],
+                                  pathway_scores[common2, , drop = FALSE],
+                                  method = "spearman", use = "pairwise.complete.obs"))
+
+  out <- as.data.frame(cor_mat) %>%
+    rownames_to_column("Embedding_Feature") %>%
+    pivot_longer(-Embedding_Feature, names_to = "Pathway", values_to = "Correlation") %>%
+    filter(!is.na(Correlation)) %>%
+    mutate(P       = spearman_p(Correlation, length(common2)),
+           FDR_cor = p.adjust(P, method = "BH"))                 # BH over all dimension x pathway pairs
+
+  attr(out, "scores") <- pathway_scores                          # reused in Figure 3.2 and 05
+  out
+}
+
+# ---- Clinical covariates (shared with 05) ----
+collapse_stage <- function(x) {                                  # "STAGE IIIC" -> "III"
+  x <- toupper(as.character(x))
+  s <- ifelse(grepl("STAGE\\s*[IV]+", x, perl = TRUE),
+              sub(".*STAGE\\s*([IV]+).*", "\\1", x, perl = TRUE), NA_character_)
+  s[!s %in% c("I", "II", "III", "IV")] <- NA_character_
+  s
+}
+
+collapse_grade <- function(x) {                                  # "G3" -> "G3", "GX" -> NA
+  x <- toupper(as.character(x))
+  ifelse(grepl("G[1-4]", x), sub(".*(G[1-4]).*", "\\1", x), NA_character_)
+}
+
+# Among columns matching the pattern, pick the one with most parseable values
+pick_col <- function(df, pattern, parse = identity) {
+  hits <- grep(pattern, names(df), ignore.case = TRUE, value = TRUE)
+  if (length(hits) == 0) return(NULL)
+  n_ok <- vapply(hits, function(h) sum(!is.na(parse(df[[h]]))), integer(1))
+  if (max(n_ok) == 0) return(NULL)
+  hits[which.max(n_ok)]
+}
+
+# Age, Stage and Grade as a data frame. Missing age is median-imputed and
+# missing stage/grade become a "Missing" level, so every patient is kept.
+clinical_vars <- function(m, min_obs = 0.5) {
+  num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+  age_col   <- pick_col(m, "years_to_birth|age_at_initial_pathologic_diagnosis|age_at_diagnosis", num)
+  stage_col <- pick_col(m, "pathologic_stage|clinical_stage|tumor_stage", collapse_stage)
+  grade_col <- pick_col(m, "histologic_grade|tumor_grade", collapse_grade)
+
+  vars <- list()
+  if (!is.null(age_col)) {
+    a <- num(m[[age_col]])
+    if (mean(!is.na(a)) >= min_obs) { a[is.na(a)] <- median(a, na.rm = TRUE); vars$Age <- a }
+  }
+  if (!is.null(stage_col)) {
+    s <- collapse_stage(m[[stage_col]])
+    if (mean(!is.na(s)) >= min_obs && length(unique(na.omit(s))) > 1) {
+      s[is.na(s)] <- "Missing"; vars$Stage <- factor(s)
+    }
+  }
+  if (!is.null(grade_col)) {
+    g <- collapse_grade(m[[grade_col]])
+    if (mean(!is.na(g)) >= min_obs && length(unique(na.omit(g))) > 1) {
+      g[is.na(g)] <- "Missing"; vars$Grade <- factor(g)
+    }
+  }
+  if (length(vars) == 0) return(NULL)
+  out <- as.data.frame(vars)
+  rownames(out) <- rownames(m)
+  out
+}
+
+# Design matrix of the clinical covariates, for Cox and glmnet
+build_clinical <- function(m) {
+  v <- clinical_vars(m)
+  if (is.null(v)) return(NULL)
+  X <- model.matrix(~ ., data = v)[, -1, drop = FALSE]           # dummy-code, drop intercept
+  rownames(X) <- rownames(m)
+  X
+}
+
+# ---- Cross-validation ----
+
+# Random folds, balanced for deaths
+strat_folds <- function(event, k) {
+  f <- integer(length(event))
+  for (lv in unique(event)) {
+    idx <- which(event == lv)
+    f[idx] <- sample(rep_len(seq_len(k), length(idx)))
+  }
+  f
+}
+
+# Whole sites go to one fold. Site order is jittered so repeats differ while
+# fold sizes stay roughly balanced.
+site_folds <- function(site, k) {
+  n_site  <- table(site)
+  k       <- min(k, length(n_site))
+  ord     <- names(n_site)[order(-as.numeric(n_site) * runif(length(n_site), 0.75, 1.25))]
+  load    <- numeric(k)                                          # patients assigned per fold
+  fold_of <- setNames(integer(length(ord)), ord)
+  for (s in ord) {
+    j <- which.min(load)
+    fold_of[s] <- j
+    load[j] <- load[j] + n_site[[s]]
+  }
+  unname(fold_of[site])
+}
+
+# Fit on training rows, return linear predictors (risk scores) for test rows
+fit_predict <- function(Xtr, ytr, Xte, type, alpha = 0.5) {
+  if (type == "coxph") {                                         # clinical: unpenalised Cox
+    keep <- apply(Xtr, 2, sd) > 0                                # dummy levels absent from this fold
+    if (!any(keep)) return(rep(NA_real_, nrow(Xte)))
+    Xtr <- Xtr[, keep, drop = FALSE]; Xte <- Xte[, keep, drop = FALSE]
+    fit <- tryCatch(suppressWarnings(coxph(ytr ~ Xtr)), error = function(e) NULL)
+    if (is.null(fit)) return(rep(NA_real_, nrow(Xte)))
+    b <- coef(fit); b[is.na(b)] <- 0
+    return(drop(Xte %*% b))
+  }
+  cv <- tryCatch(cv.glmnet(Xtr, ytr, family = "cox", alpha = alpha, nfolds = 5, type.measure = "C"),
+                 error = function(e) NULL)
+  if (is.null(cv))                                               # C undefined in tiny inner folds
+    cv <- tryCatch(cv.glmnet(Xtr, ytr, family = "cox", alpha = alpha, nfolds = 5),
+                   error = function(e) NULL)
+  if (is.null(cv)) return(rep(NA_real_, nrow(Xte)))
+  drop(stats::predict(cv, newx = Xte, s = "lambda.min", type = "link"))
+}
+
+# Harrell's C using only pairs within the same test fold, so scores from
+# different fold models are never compared. reverse = TRUE: higher score = higher risk.
+c_strat <- function(time, event, lp, fold) {
+  ok <- !is.na(lp)
+  if (sum(event[ok] == 1) < 2) return(NA_real_)
+  tt <- time[ok]; ee <- event[ok]; ll <- lp[ok]; ff <- fold[ok]
+  concordance(Surv(tt, ee) ~ ll + strata(ff), reverse = TRUE)$concordance
+}
+
+# C per model (averaged over repeats) plus patient-bootstrap replicates for CIs.
+# All models are scored on the same resamples, so differences are paired.
+boot_perf <- function(time, event, lp_by_model, folds, B = 500, seed = 1) {
+  R <- ncol(folds)
+  cfun <- function(idx) sapply(lp_by_model, function(L)
+    mean(sapply(seq_len(R), function(r)
+      c_strat(time[idx], event[idx], L[idx, r], folds[idx, r])), na.rm = TRUE))
+  est <- cfun(seq_along(time))                                   # all patients
+  set.seed(seed)
+  bs <- do.call(rbind, lapply(seq_len(B), function(b)
+    cfun(sample.int(length(time), replace = TRUE))))
+  list(est = est, boot = bs)
+}
+```
+
+# Per-dimension analysis
+
+## Survival associations of each dimension
+
+All 768 dimensions are tested in both versions, on the same patients.
+
+```{r survival}
+run_cox <- function(E, m, label, cc) {
+  r <- get_survival_coefficients(E, m, fdr_thresh = 1)           # keep every dimension
+  if (is.null(r)) return(NULL)
+  r$Correction <- label
+  r$Cancer     <- cc
+  r
+}
+
+surv_all <- bind_rows(lapply(main_cancers, function(cc) {
+  cat(cc, "- survival\n")
+  pts <- Reduce(intersect, list(rownames(embed_corrected[[cc]]),
+                                rownames(embed_raw[[cc]]), rownames(meta[[cc]])))
+  bind_rows(
+    run_cox(embed_raw[[cc]][pts, , drop = FALSE],       meta[[cc]], "Raw",    cc),
+    run_cox(embed_corrected[[cc]][pts, , drop = FALSE], meta[[cc]], "ComBat", cc))
+}))
+
+surv_results <- surv_all %>% filter(!is.na(FDR), FDR < fdr_thresh)   # significant dimensions
+```
+
+## Figure 3.1 Effect of correction on per-dimension survival associations
+
+**Purpose:** shows whether site correction changed which dimensions predict survival.
+**How to read:** each point is one dimension. r close to 1 means correction
+kept the direction and size of most survival effects. Dimensions marked "Lost
+after correction" should have high site R2 (yellow), meaning their
+association was partly driven by site.
+
+```{r fig3_1, fig.width=13, fig.height=4.5}
+site_r2_df <- bind_rows(lapply(main_cancers, function(cc) {
+  m   <- meta[[cc]]
+  pts <- intersect(rownames(embed_corrected[[cc]]), rownames(m))
+  pts <- pts[!is.na(m[pts, "TSS.Grouped"])]
+  E   <- as.matrix(embed_raw[[cc]][pts, , drop = FALSE])
+  data.frame(Cancer = cc, Feature = colnames(E),
+             Site_R2 = site_adj_r2(E, m[pts, "TSS.Grouped"]))    # how much each dimension tracks site
+}))
+
+dim_df <- surv_all %>%
+  select(Cancer, Feature, Correction, LogHR, FDR) %>%
+  pivot_wider(names_from = Correction, values_from = c(LogHR, FDR)) %>%
+  left_join(site_r2_df, by = c("Cancer", "Feature")) %>%
+  mutate(Status = case_when(
+           FDR_Raw < fdr_thresh & FDR_ComBat < fdr_thresh ~ "Significant in both",
+           FDR_Raw < fdr_thresh                           ~ "Lost after correction",
+           FDR_ComBat < fdr_thresh                        ~ "Gained after correction",
+           TRUE                                           ~ "Neither"),
+         Cancer = factor(Cancer, levels = main_cancers))
+
+r_lab <- dim_df %>%
+  group_by(Cancer) %>%
+  summarise(r = cor(LogHR_Raw, LogHR_ComBat, use = "complete.obs"), .groups = "drop") %>%
+  mutate(label = sprintf("r = %.2f", r))
+
+ggplot(dim_df, aes(LogHR_Raw, LogHR_ComBat)) +
+  geom_hline(yintercept = 0, colour = "grey85") +
+  geom_vline(xintercept = 0, colour = "grey85") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(data = filter(dim_df, Status == "Neither"),
+             aes(colour = Site_R2), size = 0.8, alpha = 0.5) +
+  geom_point(data = filter(dim_df, Status != "Neither"),
+             aes(colour = Site_R2, shape = Status), size = 2) +
+  geom_text(data = r_lab, aes(x = -Inf, y = Inf, label = label),
+            hjust = -0.15, vjust = 1.4, size = 3.2, inherit.aes = FALSE) +
+  facet_wrap(~ Cancer, nrow = 1) +
+  scale_colour_viridis_c(name = "Site adj. R²\n(raw)", limits = c(0, NA), oob = scales::squish) +
+  scale_shape_manual(values = c("Significant in both" = 16,
+                                "Lost after correction" = 4,
+                                "Gained after correction" = 17)) +
+  labs(title = "Figure 3.1 Effect of site correction on per-dimension survival associations",
+       x = "log HR per SD, raw embedding", y = "log HR per SD, corrected embedding",
+       shape = paste0("FDR < ", fdr_thresh)) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+```
+
+## GSVA pathway scores
+
+Hallmark activity per patient from RNA-seq, correlated with every corrected
+embedding dimension. The patient-level scores are reused in Figure 3.2 and 05.
+
+```{r gsva}
+gsva_scores_by_cancer <- list()
+pathway_list <- list()
+
+for (cc in main_cancers) {
+  cat(cc, "- GSVA\n")
+  rna <- get_assay(omics[[cc]], "RNASeq2GeneNorm")              # primary-tumour RNA-seq
+  if (is.null(rna)) { cat("  no RNA-seq assay found\n"); next }
+
+  res <- get_gsva_pathway(rna, embed_corrected[[cc]])
+  if (is.null(res)) next
+
+  gsva_scores_by_cancer[[cc]] <- attr(res, "scores")
+  pathway_list[[cc]] <- res %>% mutate(Cancer = cc)
+}
+
+pathway_results <- bind_rows(pathway_list)
+cat("Pathway correlations for", length(pathway_list), "cancers\n")
+```
+
+## Table 3.1 Survival-associated dimensions and correlated pathways
+
+**Purpose:** links the prognostic image dimensions to transcriptional programmes.
+**How to read:** each row is a dimension associated with survival after
+correction, followed by the Hallmark pathways it correlates with most
+strongly. Pathways that recur across rows (for example proliferation or
+immune programmes) are the biological themes to name in the text. Rows with no
+pathway are prognostic dimensions not explained by Hallmark activity. The full
+list is in `Table3_1_full.xlsx`.
+
+```{r table3_1}
+# Only correlations passing FDR are attached
+sig_paths <- pathway_results %>%
+  filter(FDR_cor < 0.05) %>%
+  select(Cancer, Feature = Embedding_Feature, Pathway, Correlation, FDR_cor)
+
+dim_pathways <- surv_results %>%
+  filter(Correction == "ComBat") %>% select(-Correction) %>%      # corrected embeddings only
+  left_join(sig_paths, by = c("Cancer", "Feature")) %>%
+  group_by(Cancer, Feature) %>%
+  arrange(desc(abs(Correlation)), .by_group = TRUE) %>%
+  mutate(Rank = row_number()) %>%                                 # 1 = strongest pathway
+  ungroup()
+
+write_xlsx(dim_pathways, file.path(data_dir, "Table3_1_full.xlsx"))
+
+tab3_1 <- dim_pathways %>%
+  filter(Rank <= 2) %>%                                           # two strongest pathways per dimension
+  mutate(Path_txt = ifelse(is.na(Pathway), NA_character_,
+                           sprintf("%s (%.2f)", clean_pw(Pathway), Correlation))) %>%
+  select(Cancer, Feature, HR, CI_low, CI_high, P_value, FDR, Rank, Path_txt) %>%
+  pivot_wider(names_from = Rank, values_from = Path_txt, names_prefix = "Pathway_")
+for (nm in c("Pathway_1", "Pathway_2"))
+  if (!nm %in% names(tab3_1)) tab3_1[[nm]] <- NA_character_
+
+tab3_1 %>%
+  group_by(Cancer) %>%
+  slice_min(FDR, n = 15, with_ties = FALSE) %>%                   # 15 strongest per cancer
+  ungroup() %>%
+  transmute(Cancer, Dimension = sub("slide_feat_", "", Feature),
+            `HR per SD (95% CI)` = sprintf("%.2f (%.2f–%.2f)", HR, CI_low, CI_high),
+            P = fmt_p(P_value), FDR = fmt_p(FDR),
+            `Pathway 1 (ρ)` = Pathway_1, `Pathway 2 (ρ)` = Pathway_2) %>%
+  gt(groupname_col = "Cancer") %>%
+  sub_missing(missing_text = "-") %>%
+  tab_header(title = "Table 3.1 Survival-associated embedding dimensions and correlated Hallmark pathways",
+             subtitle = paste("Corrected embeddings; 15 lowest-FDR dimensions per cancer;",
+                              "pathways shown where the correlation passes FDR < 0.05")) %>%
+  tab_options(table.font.size = 11, heading.align = "center")
+```
+
+# Prognostic value of the whole embedding
+
+## Cross-validated C-index
+
+For each cancer, three Cox models are compared: clinical variables only (age,
+stage and grade where available), the raw embedding, and the corrected
+embedding (elastic-net Cox on all 768 dimensions). Every risk score comes from
+a model that never saw that patient (5-fold cross-validation, repeated 3
+times). In the **primary, site-held-out** scheme, all patients from a site are
+in the same test fold, so a model cannot benefit from recognising the site.
+Random folds are shown in Table S3.4. 95% CIs come from 500 bootstrap
+resamples of patients. This chunk takes several minutes per cancer; set
+`cv_repeats <- 1` for a first pass.
+
+```{r cindex}
+cv_k       <- 5     # folds: every patient is tested once per repeat
+cv_repeats <- 3     # repeats with different splits, averaged
+en_alpha   <- 0.5   # elastic net: 0 = ridge, 1 = lasso
+min_deaths <- 20    # cancers with fewer deaths are skipped
+n_boot     <- 500   # bootstrap resamples for the CIs
+
+perf_rows <- list() # one summary row per cancer and fold scheme
+oof_risk  <- list() # one out-of-fold risk score per patient (Table 3.3, Figure 3.2)
+
+for (cc in main_cancers) {
+  m   <- meta[[cc]]
+  pts <- Reduce(intersect, list(rownames(m), rownames(embed_raw[[cc]]),
+                                rownames(embed_corrected[[cc]])))   # patients in all three
+  m     <- m[pts, , drop = FALSE]
+  time  <- suppressWarnings(as.numeric(m$time))
+  event <- suppressWarnings(as.numeric(m$event))
+  ok    <- complete.cases(time, event) & time > 0 & !is.na(m$TSS.Code)
+  if (sum(event[ok] == 1) < min_deaths) {
+    message(cc, ": ", sum(event[ok] == 1), " deaths, below ", min_deaths, "; skipped"); next
+  }
+  pts <- pts[ok]; m <- m[ok, , drop = FALSE]; time <- time[ok]; event <- event[ok]
+  y    <- Surv(time, event)                                       # Cox outcome
+  site <- as.character(m$TSS.Code)                                # for site-held-out folds
+
+  feats <- intersect(colnames(embed_raw[[cc]]), colnames(embed_corrected[[cc]]))
+  X_cli <- build_clinical(m)                                      # age/stage/grade, or NULL
+
+  models <- list(
+    Raw       = list(X = as.matrix(embed_raw[[cc]][pts, feats]),       type = "glmnet"),
+    Corrected = list(X = as.matrix(embed_corrected[[cc]][pts, feats]), type = "glmnet"))
+  if (!is.null(X_cli))
+    models <- c(list(Clinical = list(X = X_cli, type = "coxph")), models)
+
+  lp_store <- list(); fold_store <- list()
+
+  for (cv in c("Random", "Site-held-out")) {
+    fold_store[[cv]] <- matrix(NA_integer_, length(pts), cv_repeats)                        # fold per patient
+    lp_store[[cv]]   <- lapply(models, function(x) matrix(NA_real_, length(pts), cv_repeats))  # risk per patient
+
+    for (r in seq_len(cv_repeats)) {
+      set.seed(if (cv == "Random") 1000 + r else 2000 + r)        # reproducible splits
+      folds <- if (cv == "Random") strat_folds(event, cv_k) else site_folds(site, cv_k)
+      fold_store[[cv]][, r] <- folds
+
+      for (fk in sort(unique(folds))) {
+        te <- folds == fk; tr <- !te                              # test / train rows
+        if (sum(event[tr] == 1) < 10) next                        # too few training deaths
+        for (nm in names(models)) {
+          X <- models[[nm]]$X
+          lp_store[[cv]][[nm]][te, r] <- fit_predict(X[tr, , drop = FALSE], y[tr],
+                                                     X[te, , drop = FALSE],
+                                                     models[[nm]]$type, alpha = en_alpha)
+        }
+      }
+    }
+
+    # Bootstrap C for every model on the same resampled patients
+    b <- boot_perf(time, event, lp_store[[cv]], fold_store[[cv]], B = n_boot, seed = 3000)
+    q <- function(x) unname(quantile(x, c(0.025, 0.975), na.rm = TRUE))   # percentile CI
+
+    row <- data.frame(Cancer = cc, CV = cv, n = length(pts), Deaths = sum(event == 1))
+    for (nm in c("Clinical", "Raw", "Corrected")) {
+      has <- nm %in% names(b$est)
+      row[[paste0(nm, "_C")]]  <- if (has) b$est[[nm]] else NA_real_
+      row[[paste0(nm, "_lo")]] <- if (has) q(b$boot[, nm])[1] else NA_real_
+      row[[paste0(nm, "_hi")]] <- if (has) q(b$boot[, nm])[2] else NA_real_
+    }
+
+    # Corrected embedding vs clinical, paired on the same resamples
+    row$Diff <- row$Diff_lo <- row$Diff_hi <- NA_real_
+    row$Frac <- row$Frac_lo <- row$Frac_hi <- NA_real_
+    if ("Clinical" %in% names(b$est)) {
+      d <- b$boot[, "Corrected"] - b$boot[, "Clinical"]
+      row$Diff <- b$est[["Corrected"]] - b$est[["Clinical"]]
+      row$Diff_lo <- q(d)[1]; row$Diff_hi <- q(d)[2]
+      if (row$Clinical_lo > 0.5) {                                # only if clinical beats chance
+        fr <- (b$boot[, "Corrected"] - 0.5) / (b$boot[, "Clinical"] - 0.5)
+        row$Frac <- (b$est[["Corrected"]] - 0.5) / (b$est[["Clinical"]] - 0.5)
+        row$Frac_lo <- q(fr)[1]; row$Frac_hi <- q(fr)[2]
+      }
+    }
+
+    # Corrected minus raw embedding: the direct test of what correction changed
+    d_raw <- b$boot[, "Corrected"] - b$boot[, "Raw"]
+    row$DiffRaw <- b$est[["Corrected"]] - b$est[["Raw"]]
+    row$DiffRaw_lo <- q(d_raw)[1]; row$DiffRaw_hi <- q(d_raw)[2]
+
+    perf_rows[[length(perf_rows) + 1]] <- row
+  }
+
+  # One risk score per patient from the primary (site-held-out) scheme:
+  # z-scored within each test fold, then averaged over repeats
+  zfun <- function(v) if (sum(!is.na(v)) > 1 && sd(v, na.rm = TRUE) > 0)
+                        as.numeric(scale(v)) else rep(NA_real_, length(v))   # constant score: no information
+  zr <- do.call(cbind, lapply(seq_len(cv_repeats), function(r)
+    ave(lp_store[["Site-held-out"]][["Corrected"]][, r],
+        fold_store[["Site-held-out"]][, r], FUN = zfun)))
+  risk <- rowMeans(zr, na.rm = TRUE); risk[is.nan(risk)] <- NA
+  oof_risk[[cc]] <- setNames(risk, pts)
+
+  cat(cc, "done; clinical covariates:",
+      if (is.null(X_cli)) "none" else paste(colnames(clinical_vars(m)), collapse = ", "), "\n")
+}
+
+cidx_sum <- bind_rows(perf_rows)
+```
+
+## Table 3.2 Prognostic value of the slide embedding alone
+
+**Purpose:** asks whether the slide alone predicts survival in patients from
+sites the model never saw, and how close it comes to clinical variables.
+**How to read:** a bold corrected C (CI excludes 0.5) means the slide carries
+prognostic information on its own after site effects are removed. "% of
+clinical discrimination" shows how far the slide goes towards clinical
+staging (100% = equal). "Corrected minus raw" near 0 means correction cost no
+prognostic signal; a positive value means it improved transfer to new sites.
+
+```{r table3_2}
+perf_table <- function(df, cv, title) {
+  df %>%
+    filter(CV == cv) %>%
+    mutate(Cancer = factor(Cancer, levels = main_cancers)) %>%
+    arrange(Cancer) %>%
+    transmute(Cancer = as.character(Cancer), Deaths,
+              Clin = fmt_ci(Clinical_C, Clinical_lo, Clinical_hi),
+              Corr = fmt_ci(Corrected_C, Corrected_lo, Corrected_hi),
+              Diff = fmt_ci(Diff, Diff_lo, Diff_hi),
+              Frac = ifelse(is.na(Frac) | Corrected_lo <= 0.5, NA_character_,
+                            sprintf("%.0f%% (%.0f to %.0f%%)", 100 * Frac, 100 * Frac_lo, 100 * Frac_hi)),
+              Raw     = fmt_ci(Raw_C, Raw_lo, Raw_hi),
+              DiffRaw = fmt_ci(DiffRaw, DiffRaw_lo, DiffRaw_hi),
+              Corrected_lo) %>%
+    gt() %>%
+    cols_hide(Corrected_lo) %>%
+    tab_spanner(label = "C-index (95% CI)", columns = c(Clin, Corr)) %>%
+    tab_spanner(label = "Corrected embedding vs clinical", columns = c(Diff, Frac)) %>%
+    tab_spanner(label = "Effect of site correction", columns = c(Raw, DiffRaw)) %>%
+    cols_label(Clin = "Clinical", Corr = "Corrected embedding",
+               Diff = "Difference in C", Frac = "% of clinical discrimination",
+               Raw = "Raw embedding", DiffRaw = "Corrected minus raw") %>%
+    tab_style(style = cell_text(weight = "bold"),
+              locations = cells_body(columns = Corr,
+                                     rows = !is.na(Corrected_lo) & Corrected_lo > 0.5)) %>%
+    sub_missing(missing_text = "-") %>%
+    tab_header(title = title,
+               subtitle = paste0(cv, " ", cv_k, "-fold cross-validation, ", cv_repeats,
+                                 " repeats; elastic-net Cox (alpha = ", en_alpha, ")")) %>%
+    tab_source_note(paste0(
+      "Bold: interval excludes 0.5. % of clinical discrimination = (C_embedding - 0.5) / ",
+      "(C_clinical - 0.5), shown only where both intervals exclude 0.5. ",
+      "Differences are paired (both models scored on the same bootstrap resamples). ",
+      "Clinical: age, stage and grade where available. CIs from ", n_boot,
+      " bootstrap resamples of patients. Cancers with fewer than ", min_deaths,
+      " deaths were not analysed.")) %>%
+    tab_options(table.font.size = 12, heading.align = "center")
+}
+
+perf_table(cidx_sum, "Site-held-out",
+           "Table 3.2 Prognostic value of the slide embedding alone, compared with clinical variables")
+```
+
+## Table 3.3 Added value over clinical variables
+
+**Purpose:** asks whether the slide adds prognostic information beyond age,
+stage and grade.
+**How to read:** each patient's out-of-fold risk score (from Table 3.2's
+site-held-out models, so it is not overfit) is added to a Cox model of the
+clinical variables. A likelihood-ratio P < 0.05 means the embedding carries
+information that clinical staging does not.
+
+```{r table3_3}
+lrt_tab <- bind_rows(lapply(names(oof_risk), function(cc) {
+  r   <- oof_risk[[cc]]
+  pts <- names(r)[!is.na(r)]                                      # patients with a risk score
+  m   <- meta[[cc]][pts, , drop = FALSE]
+  t   <- suppressWarnings(as.numeric(m$time))
+  e   <- suppressWarnings(as.numeric(m$event))
+  ok  <- complete.cases(t, e) & t > 0
+  Xc  <- build_clinical(m)                                        # same covariates as Table 3.2
+  if (is.null(Xc) || sum(e[ok] == 1) < 20) return(NULL)
+
+  y  <- Surv(t[ok], e[ok])
+  Xc <- Xc[ok, , drop = FALSE]
+  rk <- r[pts][ok]
+
+  f0 <- coxph(y ~ Xc)                                             # clinical only
+  f1 <- coxph(y ~ Xc + rk)                                        # clinical + embedding risk
+  a  <- anova(f0, f1)                                             # likelihood-ratio test
+
+  data.frame(Cancer = cc, n = sum(ok), Deaths = sum(e[ok] == 1),
+             HR = sprintf("%.2f (%.2f–%.2f)", exp(coef(f1)["rk"]),
+                          exp(confint(f1))["rk", 1], exp(confint(f1))["rk", 2]),
+             LRT_P = a[["Pr(>|Chi|)"]][2])
+}))
+
+lrt_tab %>%
+  mutate(LRT_P = fmt_p(LRT_P)) %>%
+  gt() %>%
+  cols_label(HR = "HR per SD of risk score (95% CI)", LRT_P = "Likelihood-ratio P") %>%
+  tab_header(title = "Table 3.3 Added prognostic value of the corrected embedding over clinical variables",
+             subtitle = "Out-of-fold risk score (site-held-out CV) added to a Cox model of age, stage and grade") %>%
+  tab_options(table.font.size = 12, heading.align = "center")
+```
+
+## Figure 3.2 Pathways associated with embedding-predicted risk
+
+**Purpose:** describes the biology of patients the slide model calls high-risk.
+**How to read:** red pathways are more active in higher-risk patients, blue in
+lower-risk patients. A pathway red in several cancers is a shared biological
+reading of what the image model captures. This connects Table 3.2 (the slide
+predicts outcome) with biology.
+
+```{r fig3_2, fig.width=7, fig.height=10}
+risk_path <- bind_rows(lapply(names(oof_risk), function(cc) {
+  sc <- gsva_scores_by_cancer[[cc]]                               # patients x Hallmark scores
+  if (is.null(sc)) return(NULL)
+  r   <- oof_risk[[cc]]
+  pts <- intersect(names(r)[!is.na(r)], rownames(sc))            # patients with both
+  if (length(pts) < 20) return(NULL)
+  bind_rows(lapply(colnames(sc), function(pw) {
+    ct <- suppressWarnings(cor.test(r[pts], sc[pts, pw], method = "spearman", exact = FALSE))
+    data.frame(Cancer = cc, Pathway = pw, rho = unname(ct$estimate),
+               P = ct$p.value, n = length(pts))
+  })) %>%
+    mutate(FDR = p.adjust(P, method = "BH"))                      # within cancer
+}))
+
+if (nrow(risk_path) > 0) {
+  risk_plot <- risk_path %>%
+    mutate(Pathway = clean_pw(Pathway),
+           Cancer  = factor(Cancer, levels = main_cancers),
+           star    = ifelse(FDR < 0.05, "*", ""))
+  pw_order <- risk_plot %>% group_by(Pathway) %>%
+    summarise(m = mean(rho), .groups = "drop") %>% arrange(m) %>% pull(Pathway)
+  lim <- max(abs(risk_plot$rho))
+
+  ggplot(risk_plot, aes(Cancer, factor(Pathway, levels = pw_order), fill = rho)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = star), vjust = 0.75, size = 4) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         limits = c(-lim, lim), name = "Spearman ρ") +
+    labs(title = "Figure 3.2 Hallmark pathways associated with embedding-predicted risk",
+         subtitle = paste("Out-of-fold risk from corrected embeddings (site-held-out CV);",
+                          "positive ρ = higher in higher-risk patients; * FDR < 0.05"),
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+} else {
+  cat("No cancers with both a risk score and GSVA scores.\n")
+}
+```
+
+# Supplementary
+
+## Table S3.1 Survival-associated dimension counts
+
+**Purpose:** shows how much prognostic signal is spread across the 768 dimensions.
+**How to read:** compare "Nominal P < 0.05" with "Expected by chance" (5% of
+768). Counts well above chance mean real prognostic signal. FDR counts mostly
+follow the number of deaths, so they should not be compared between cancers.
+
+```{r tableS3_1}
+deaths <- bind_rows(lapply(main_cancers, function(cc) {
+  m  <- meta[[cc]][rownames(embed_corrected[[cc]]), , drop = FALSE]
+  t  <- suppressWarnings(as.numeric(m$time))
+  e  <- suppressWarnings(as.numeric(m$event))
+  ok <- complete.cases(t, e) & t > 0
+  data.frame(Cancer = cc, Deaths = sum(e[ok] == 1))
+}))
+
+nominal <- surv_all %>%
+  group_by(Cancer, Correction) %>%
+  summarise(Nominal = sum(P_value < 0.05, na.rm = TRUE),
+            Tested  = sum(!is.na(P_value)), .groups = "drop") %>%
+  pivot_wider(names_from = Correction, values_from = c(Nominal, Tested))
+
+surv_results %>%
+  dplyr::count(Cancer, Correction, name = "N") %>%
+  tidyr::complete(Cancer = main_cancers, Correction = c("Raw", "ComBat"), fill = list(N = 0)) %>%
+  pivot_wider(names_from = Correction, values_from = N) %>%
+  left_join(nominal, by = "Cancer") %>%
+  left_join(deaths, by = "Cancer") %>%
+  mutate(Expected = round(0.05 * Tested_ComBat),
+         Cancer   = factor(Cancer, levels = main_cancers)) %>%
+  arrange(Cancer) %>%
+  select(Cancer, Deaths, Raw, ComBat, Nominal_Raw, Nominal_ComBat, Expected) %>%
+  gt() %>%
+  tab_spanner(label = paste0("FDR < ", fdr_thresh), columns = c(Raw, ComBat)) %>%
+  tab_spanner(label = "Nominal P < 0.05", columns = c(Nominal_Raw, Nominal_ComBat, Expected)) %>%
+  cols_label(Raw = "Raw", ComBat = "Corrected", Nominal_Raw = "Raw",
+             Nominal_ComBat = "Corrected", Expected = "Expected by chance") %>%
+  sub_missing(missing_text = "-") %>%
+  tab_header(title = "Table S3.1 Survival-associated embedding dimensions (of 768)",
+             subtitle = "Univariable Cox per dimension; counts depend strongly on the number of deaths") %>%
+  tab_options(table.font.size = 12, heading.align = "center")
+```
+
+## Table S3.2 Site signal by change in survival association
+
+**Purpose:** quantifies what Figure 3.1 shows.
+**How to read:** if "Lost after correction" dimensions have a higher median
+site R2 than "Significant in both", correction specifically removed
+associations that were partly driven by site.
+
+```{r tableS3_2}
+dim_df %>%
+  group_by(Cancer, Status) %>%
+  summarise(Dimensions = n(), Median_site_R2 = median(Site_R2, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Cancer = as.character(Cancer)) %>%
+  gt(groupname_col = "Cancer") %>%
+  fmt_number(columns = Median_site_R2, decimals = 3) %>%
+  cols_label(Status = "", Median_site_R2 = "Median site adj. R² (raw)") %>%
+  tab_header(title = "Table S3.2 Site signal by change in survival association") %>%
+  tab_options(table.font.size = 12, heading.align = "center")
+```
+
+
+## Figure S3.1 Cross-cancer consistency of per-dimension effects
+
+**Purpose:** a softer test of replication that uses all 768 dimensions, not
+only significant ones.
+**How to read:** positive off-diagonal r means dimensions tend to carry the
+same prognostic direction in both cancers. r near 0 means each cancer uses the
+embedding differently.
+
+```{r figS3_1, fig.width=9, fig.height=4.5}
+xc <- surv_all %>%
+  select(Cancer, Correction, Feature, LogHR) %>%
+  group_by(Correction) %>%
+  group_modify(~ {
+    w  <- .x %>% pivot_wider(names_from = Cancer, values_from = LogHR) %>% select(-Feature)
+    cm <- cor(w, use = "pairwise.complete.obs")
+    setNames(as.data.frame(as.table(cm)), c("Cancer1", "Cancer2", "r"))
+  }) %>%
+  ungroup() %>%
+  mutate(Correction = factor(Correction, levels = c("Raw", "ComBat"), labels = c("Raw", "Corrected")),
+         Cancer1 = factor(Cancer1, levels = main_cancers),
+         Cancer2 = factor(Cancer2, levels = main_cancers))
+
+ggplot(xc, aes(Cancer1, Cancer2, fill = r)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 3) +
+  facet_wrap(~ Correction) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-1, 1), name = "r") +
+  coord_equal() +
+  labs(title = "Figure S3.1 Correlation of per-dimension log HR between cancer types",
+       subtitle = "Across all 768 dimensions", x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+```
+
+## Table S3.3 Random versus site-held-out cross-validation
+
+**Purpose:** shows how much naive (random-fold) performance depends on site.
+**How to read:** a model whose C drops from random to site-held-out folds was
+partly relying on site. A larger drop for the raw than the corrected
+embedding shows that site leakage inflates naive performance estimates.
+
+```{r tableS3_4}
+cidx_sum %>%
+  select(Cancer, CV, matches("^(Clinical|Raw|Corrected)_(C|lo|hi)$")) %>%
+  pivot_longer(-c(Cancer, CV), names_to = c("Model", ".value"), names_sep = "_") %>%
+  filter(!is.na(C)) %>%
+  mutate(txt   = fmt_ci(C, lo, hi),
+         Model = factor(Model, levels = c("Clinical", "Raw", "Corrected"),
+                        labels = c("Clinical", "Embedding (raw)", "Embedding (corrected)"))) %>%
+  select(Cancer, Model, CV, txt) %>%
+  pivot_wider(names_from = CV, values_from = txt) %>%
+  arrange(factor(Cancer, levels = main_cancers), Model) %>%
+  mutate(Model = as.character(Model)) %>%
+  gt(groupname_col = "Cancer") %>%
+  cols_label(Model = "") %>%
+  tab_spanner(label = "C-index (95% CI)", columns = c(Random, `Site-held-out`)) %>%
+  tab_header(title = "Table S3.4 Random versus site-held-out cross-validation") %>%
+  tab_options(table.font.size = 12, heading.align = "center")
+```
+
+## Save results
+
+```{r save}
+saveRDS(surv_all,                     file.path(data_dir, "surv_all.rds"))              # used in 05
+saveRDS(gsva_scores_by_cancer,        file.path(data_dir, "gsva_scores_by_cancer.rds")) # used in 05
+saveRDS(lapply(meta, clinical_vars),  file.path(data_dir, "clin_vars_by_cancer.rds"))   # used in 05
+saveRDS(pathway_results,              file.path(data_dir, "pathway_results.rds"))
+saveRDS(cidx_sum,                     file.path(data_dir, "cindex_summary.rds"))
+saveRDS(oof_risk,                     file.path(data_dir, "oof_risk_scores.rds"))
+```
+
+```{r session}
+sessionInfo()
+```

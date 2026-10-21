@@ -1,0 +1,379 @@
+---
+title: "01 - TCGA Data Assembly"
+subtitle: "Prov-GigaPath embeddings + matched TCGA molecular data"
+format: html
+editor: visual
+---
+
+Builds one patient-level object per TCGA cancer type that has Prov-GigaPath
+slide embeddings. Everything is kept **per cancer type** (never pooled),
+because tissue source site (TSS) is nested within cancer type (shown in 02).
+
+Outputs (in `data/`):
+
+-   `embed_raw_by_cancer.rds`: uncorrected embeddings, patients x 768
+-   `meta_by_cancer.rds`: clinical metadata with `TSS.Code`, `time`, `event`
+-   `omics_by_cancer.rds`: primary-tumour molecular assays, features x patients
+-   `slide_catalogs.rds`: slide-level catalog per cancer
+
+Main cohort: KIRC, COAD, LUAD, OV, READ. All other cancers are kept for the
+supplementary nesting and batch-effect analyses in 02.
+
+## Libraries
+
+```{r libraries, message=FALSE}
+#| output: false
+library(imageFeatureTCGA)      # Prov-GigaPath catalog (getCatalog) and slide linking (linkTCGA)
+library(curatedTCGAData)       # TCGA molecular data as MultiAssayExperiment objects
+library(MultiAssayExperiment)  # sampleMap(), experiments(), colData()
+library(SummarizedExperiment)  # assay(), rowData()
+library(TCGAutils)             # TCGAbarcode()
+library(survival)              # Surv(), survfit() for median follow-up in Table 1.1
+library(dplyr)                 # data wrangling
+library(gt)                    # publication tables
+```
+
+## Load catalog and identify all cancers
+
+```{r load_catalog}
+catalog <- getCatalog("provgigapath")                      # one row per embedding file (slide, tile, ...)
+
+all_cancers <- sort(sub("TCGA-", "", unique(catalog$Project.ID)))  # "TCGA-KIRC" -> "KIRC"
+cat("Found", length(all_cancers), "cancer types\n")
+
+# Slide-level rows only, split by cancer type
+slide_catalogs <- lapply(all_cancers, function(cc)
+  dplyr::filter(catalog, level == "slide_level", Project.ID == paste0("TCGA-", cc)))
+names(slide_catalogs) <- all_cancers
+
+print(sapply(slide_catalogs, nrow))                        # slides available per cancer
+```
+
+## Config
+
+```{r config}
+# Download only the assays that are used downstream
+assays_wanted <- c("RNASeq2GeneNorm",   # RNA-seq: GSVA scores (03) and MOFA RNA view (04)
+                   "RPPAArray",         # protein array: MOFA RPPA view (04)
+                   "GISTIC_AllByGene",  # gene-level copy number: MOFA CNV view (04)
+                   "miRNASeqGene")      # miRNA-seq: MOFA miRNA view (04)
+
+main_cancers <- c("KIRC", "COAD", "LUAD", "OV", "READ")   # primary manuscript cohort
+
+out_dir <- "data"                                         # all .rds outputs go here
+dir.create(out_dir, showWarnings = FALSE)                 # create the folder if missing
+```
+
+## Check assay availability
+
+Assay names differ between cancers, so availability is checked before
+downloading anything.
+
+```{r check_assays, message=FALSE}
+# dry.run = TRUE lists the available resources without downloading them
+avail <- lapply(all_cancers, function(cc)
+  as.character(curatedTCGAData(diseaseCode = cc, assays = "*",
+                               version = "2.1.1", dry.run = TRUE)$title))
+names(avail) <- all_cancers
+
+# TRUE where an assay exists for a cancer (rows = assays, columns = cancers)
+assay_matrix <- sapply(all_cancers, function(cc)
+  sapply(assays_wanted, function(a) any(grepl(a, avail[[cc]], fixed = TRUE))))
+
+# Check: all four should be TRUE for the main cohort, otherwise a MOFA view is missing
+assay_matrix[, main_cancers]
+```
+
+## Download molecular data
+
+```{r load_omics, message=FALSE}
+mae_list <- list()
+
+for (cc in all_cancers) {
+  req <- assays_wanted[assay_matrix[, cc]]          # request only assays this cancer has
+  if (length(req) == 0) next                        # no molecular data to link slides to
+
+  mae_list[[cc]] <- tryCatch(
+    curatedTCGAData(diseaseCode = cc, assays = req, version = "2.1.1", dry.run = FALSE),
+    error = function(e) { cat(cc, "download failed:", conditionMessage(e), "\n"); NULL })
+}
+mae_list <- Filter(Negate(is.null), mae_list)       # drop cancers that failed to download
+
+sapply(mae_list, function(m) length(experiments(m)))   # experiments per cancer
+```
+
+## Link slides to molecular data
+
+```{r link_tcga, message=FALSE}
+linked_list <- list()
+
+for (cc in names(mae_list)) {
+  cat("Linking", cc, "\n")
+  # Adds the slide embeddings to the MultiAssayExperiment as "slide_assay"
+  linked_list[[cc]] <- tryCatch(
+    linkTCGA(mae_list[[cc]], slide_catalogs[[cc]], redownload = FALSE, parallel = TRUE),
+    error = function(e) { cat("  linkTCGA failed:", conditionMessage(e), "\n"); NULL })
+}
+```
+
+## Align to patient level
+
+Every assay is collapsed to one column per patient (multiple slides or tumour
+aliquots are averaged). Only patients with a slide embedding are kept.
+Molecular assays keep primary tumour samples only, and copy-number genes get
+their symbols from `rowData`, because GISTIC stores them there rather than as
+row names.
+
+```{r align_fn}
+get_aligned_embedding_metadata <- function(mae_emb) {
+
+  # Give the embedding features names if they have none
+  if (is.null(rownames(mae_emb[["slide_assay"]])))
+    rownames(mae_emb[["slide_assay"]]) <- paste0("slide_feat_", seq_len(nrow(mae_emb[["slide_assay"]])))
+
+  sm       <- sampleMap(mae_emb)                                  # links assay columns to patients
+  patients <- unique(sm$primary[sm$assay == "slide_assay"])       # patients with at least one slide
+
+  aligned <- list()
+  for (nm in names(experiments(mae_emb))) {
+    se  <- experiments(mae_emb)[[nm]]                             # NEW: keep the object for rowData
+    mat <- assay(se)                                              # features x samples
+
+    # NEW: GISTIC keeps gene symbols in rowData, not rownames; recover them
+    if (is.null(rownames(mat)) && "Gene.Symbol" %in% names(rowData(se)))
+      rownames(mat) <- make.unique(as.character(rowData(se)$Gene.Symbol))
+    if (is.null(rownames(mat)))                                   # NEW: report any assay still unnamed
+      warning(nm, " has no feature names; rowData columns: ",
+              paste(names(rowData(se)), collapse = ", "))
+
+    # Molecular assays: keep primary tumour samples only, so adjacent-normal
+    # profiles are never averaged with the tumour. Sample type is characters
+    # 14-15 of the barcode: "01" primary solid tumour, "03" primary blood
+    # tumour, "11" normal tissue. Columns that are not full barcodes are kept.
+    if (nm != "slide_assay") {
+      full_bc <- nchar(colnames(mat)) >= 15                       # sample-level barcode?
+      st      <- substr(colnames(mat), 14, 15)                    # sample type code
+      keep    <- !full_bc | st %in% c("01", "03")
+      if (any(!keep)) cat("  ", nm, ": dropped", sum(!keep), "non-primary samples\n")
+      mat <- mat[, keep, drop = FALSE]
+    }
+
+    sm_nm   <- sm[sm$assay == nm, ]                               # sample map for this assay
+    col_pat <- sm_nm$primary[match(colnames(mat), sm_nm$colname)] # patient of each column
+
+    # Empty features x patients matrix, filled patient by patient
+    pmat <- matrix(NA_real_, nrow = nrow(mat), ncol = length(patients),
+                   dimnames = list(rownames(mat), patients))
+    for (pat in patients) {
+      cols <- which(col_pat == pat)                               # this patient's columns
+      if (length(cols) == 1) pmat[, pat] <- as.numeric(mat[, cols])
+      else if (length(cols) > 1)                                  # several slides/aliquots: average
+        pmat[, pat] <- rowMeans(matrix(as.numeric(mat[, cols]), nrow = nrow(mat)), na.rm = TRUE)
+    }
+    aligned[[nm]] <- pmat[rowSums(!is.na(pmat)) > 0, , drop = FALSE]  # drop features never observed
+  }
+
+  # Embeddings: patients x features, complete cases only
+  embed_mat <- t(aligned[["slide_assay"]])
+  embed_mat <- embed_mat[complete.cases(embed_mat), , drop = FALSE]
+
+  # Metadata: one row per patient
+  meta <- as.data.frame(colData(mae_emb))
+  meta$Patient <- TCGAbarcode(rownames(meta), participant = TRUE)  # "TCGA-XX-XXXX"
+  meta <- meta[!duplicated(meta$Patient), ]
+  rownames(meta) <- meta$Patient
+
+  # Patients with both an embedding and metadata
+  common <- intersect(rownames(embed_mat), rownames(meta))
+
+  # Molecular assays stay features x patients, restricted to the same patients
+  omics <- lapply(aligned[setdiff(names(aligned), "slide_assay")],
+                  function(m) m[, intersect(colnames(m), common), drop = FALSE])
+
+  list(embed = embed_mat[common, , drop = FALSE],
+       meta  = meta[common, , drop = FALSE],
+       omics = omics)
+}
+```
+
+```{r align_all}
+aligned_list <- list()
+
+for (cc in names(linked_list)) {
+  if (is.null(linked_list[[cc]])) next                     # linking failed for this cancer
+  res <- tryCatch(get_aligned_embedding_metadata(linked_list[[cc]]),
+                  error = function(e) { cat(cc, "alignment failed:", conditionMessage(e), "\n"); NULL })
+  if (is.null(res) || nrow(res$embed) == 0) { cat(cc, ": no aligned patients\n"); next }
+
+  res$meta$Cancer <- cc                                    # cancer label, used when pooling in 02
+  aligned_list[[cc]] <- res
+  cat(cc, "- patients:", nrow(res$embed), "| features:", ncol(res$embed),
+      "| omics views:", length(res$omics), "\n")
+}
+```
+
+## Attach TSS.Code
+
+Tissue source site is the batch variable corrected in 02. It is characters 6
+and 7 of the patient barcode (TCGA-**XX**-XXXX), so it is never missing.
+
+```{r add_tss}
+for (cc in names(aligned_list)) {
+  meta <- aligned_list[[cc]]$meta
+  meta$TSS.Code <- substr(meta$Patient, 6, 7)              # "TCGA-A3-3306" -> "A3"
+  aligned_list[[cc]]$meta <- meta
+  cat(cc, "- sites:", n_distinct(meta$TSS.Code), "\n")     # sites contributing to this cancer
+}
+```
+
+## Survival variables
+
+Column names for vital status and follow-up differ between cancers, so they
+are found by pattern. Overall survival time is days to death for patients who
+died and days to last follow-up otherwise.
+
+```{r prep_survival}
+prep_survival <- function(meta) {
+
+  # First column matching any of the patterns, or NA
+  pick <- function(patterns) {
+    hits <- unlist(lapply(patterns, function(p) grep(p, colnames(meta), value = TRUE, ignore.case = TRUE)))
+    if (length(hits) == 0) NA_character_ else hits[1]
+  }
+  col_vital  <- pick("^vital_status")
+  col_death  <- pick("days_to_death")
+  col_follow <- pick(c("days_to_last_followup", "days_to_last_follow_up"))
+  if (anyNA(c(col_vital, col_death, col_follow)))
+    warning("Missing survival columns: ", paste(c(col_vital, col_death, col_follow), collapse = ", "))
+
+  vital  <- meta[[col_vital]]
+  death  <- suppressWarnings(as.numeric(meta[[col_death]]))
+  follow <- suppressWarnings(as.numeric(meta[[col_follow]]))
+
+  # vital_status is 0/1 in curatedTCGAData; "dead" strings are accepted too
+  event <- ifelse(tolower(as.character(vital)) %in% c("1", "dead", "deceased"), 1, 0)
+  event[is.na(vital)] <- NA
+
+  meta$event <- event                                      # 1 = death, 0 = censored
+  meta$time  <- ifelse(event == 1, death, follow)          # days
+  meta
+}
+
+for (cc in names(aligned_list)) {
+  aligned_list[[cc]]$meta <- prep_survival(aligned_list[[cc]]$meta)
+  m  <- aligned_list[[cc]]$meta
+  ok <- complete.cases(m$time, m$event) & m$time > 0       # same definition used in 03 and 05
+  cat(cc, "- usable survival:", sum(ok), "| deaths:", sum(m$event[ok] == 1), "\n")
+}
+```
+
+## Save outputs
+
+```{r save}
+embed_raw_by_cancer <- lapply(aligned_list, `[[`, "embed")
+meta_by_cancer      <- lapply(aligned_list, `[[`, "meta")
+omics_by_cancer     <- lapply(aligned_list, `[[`, "omics")
+
+saveRDS(embed_raw_by_cancer, file.path(out_dir, "embed_raw_by_cancer.rds"))
+saveRDS(meta_by_cancer,      file.path(out_dir, "meta_by_cancer.rds"))
+saveRDS(omics_by_cancer,     file.path(out_dir, "omics_by_cancer.rds"))
+saveRDS(slide_catalogs,      file.path(out_dir, "slide_catalogs.rds"))
+
+cat("Saved", length(embed_raw_by_cancer), "cancers to", out_dir, "\n")
+```
+
+## Check molecular views
+
+Every view used by MOFA in 04 needs feature names. Each row below should show
+features, patients and a few example names such as gene symbols; a row with
+`names = NONE` must be fixed before running 04.
+
+```{r check_views}
+view_check <- bind_rows(lapply(main_cancers, function(cc) {
+  bind_rows(lapply(names(omics_by_cancer[[cc]]), function(nm) {
+    m <- omics_by_cancer[[cc]][[nm]]
+    data.frame(Cancer   = cc,
+               Assay    = nm,
+               Features = nrow(m),
+               Patients = sum(colSums(!is.na(m)) > 0),             # patients with any data
+               Example  = if (is.null(rownames(m))) "NONE"
+                          else paste(head(rownames(m), 3), collapse = ", "))
+  }))
+}))
+view_check
+```
+
+## Cohort tables
+
+One summary row per cancer, built once and used for both tables. Site
+sparsity (patients per site) is reported in 02, where it motivates the
+choice of batch-correction method.
+
+```{r cohort_summary}
+cohort_summary <- bind_rows(lapply(names(meta_by_cancer), function(cc) {
+  m  <- meta_by_cancer[[cc]]
+  ok <- complete.cases(m$time, m$event) & m$time > 0       # usable survival
+  # Reverse Kaplan-Meier (censoring treated as the event) gives median follow-up
+  fu <- if (sum(ok) > 1)
+          summary(survfit(Surv(m$time[ok], 1 - m$event[ok]) ~ 1))$table[["median"]] else NA
+  data.frame(Cancer     = cc,
+             Slides     = nrow(slide_catalogs[[cc]]),       # slides with an embedding
+             Patients   = nrow(m),                          # patients analysed
+             Sites      = n_distinct(m$TSS.Code),           # tissue source sites
+             Survival_n = sum(ok),                          # usable for Cox models
+             Deaths     = sum(m$event[ok] == 1),            # events: these set Cox power
+             Median_fu  = fu)                               # days
+})) %>% arrange(desc(Patients))
+
+# Shared formatting for the main and supplementary tables
+cohort_gt <- function(df, title, subtitle) {
+  df %>% gt() %>%
+    tab_header(title = title, subtitle = subtitle) %>%
+    cols_label(Survival_n = "With survival data", Median_fu = "Median follow-up (days)") %>%
+    fmt_number(columns = Median_fu, decimals = 0) %>%
+    sub_missing(missing_text = "-") %>%
+    tab_options(table.font.size = 11, heading.align = "center")
+}
+```
+
+### Table 1.1 Main cohort
+
+**Purpose:** describes the five cancers analysed throughout the paper.
+**How to read:** the number of deaths sets the statistical power of every
+survival result in 03 and 05. A cancer with few deaths should be described
+as underpowered, not as showing no association. The number of sites
+foreshadows the batch problem addressed in 02.
+
+```{r table1_1}
+cohort_summary %>%
+  filter(Cancer %in% main_cancers) %>%
+  cohort_gt("Table 1.1 Main cohort",
+            "Patients with Prov-GigaPath slide embeddings and matched clinical data")
+```
+
+### Table S1.1 All cancer types
+
+**Purpose:** shows the full TCGA set used for the supplementary nesting and
+within-cancer batch analyses in 02 (Table 2.1 and Table S2.2).
+**How to read:** many cancers each draw on many sites. This is why site
+effects have to be assessed separately within each cancer.
+
+```{r tableS1_1}
+cohort_summary %>%
+  cohort_gt("Table S1.1 All TCGA cancer types",
+            "Patients with Prov-GigaPath slide embeddings")
+```
+
+## Numbers for the text
+
+```{r numbers}
+main_rows <- filter(cohort_summary, Cancer %in% main_cancers)
+cat("All cancers:", nrow(cohort_summary), "types,", sum(cohort_summary$Patients), "patients,",
+    sum(cohort_summary$Slides), "slides\n")
+cat("Main cohort:", sum(main_rows$Patients), "patients,", sum(main_rows$Slides), "slides,",
+    sum(main_rows$Sites), "sites,", sum(main_rows$Deaths), "deaths\n")
+```
+
+```{r session}
+sessionInfo()
+```

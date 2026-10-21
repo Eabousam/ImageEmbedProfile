@@ -1,0 +1,800 @@
+---
+title: "05 - MOFA Factor Analysis"
+subtitle: "Variance decomposition, survival, and pathway interpretation"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    fig-dpi: 300
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+Interprets the MOFA factors fitted in 04. Each factor is a pattern of variation
+shared across views; factors that explain embedding variance are
+image-molecular axes.
+
+Inputs: `mofa/*.hdf5` (04), `meta_corrected_by_cancer.rds` (02),
+`gsva_scores_by_cancer.rds`, `surv_all.rds`, `clin_vars_by_cancer.rds` (03)
+
+Outputs: figures in `figures/`, tables in `tables/`, `mofa_results.rds`
+
+| Output | Question answered |
+|---|---|
+| Figure 5.1 | Which factors are shared between the image and molecular data? |
+| Figure 5.2 | Which factors predict survival, with and without clinical adjustment? |
+| Figure 5.3 | Which biological pathways does each factor reflect? |
+| Table 5.1 | Integrated interpretation of image-associated factors |
+| Table S5.1 | Full Cox results for every factor |
+| Figure S5.1 | Kaplan-Meier curves for the top factor per cancer (descriptive) |
+| Figure S5.2, Table S5.2 | Does batch correction carry through to the factors? |
+| Figure S5.3 | Do factors track stage, grade or age? |
+| Figure S5.4 | Which embedding dimensions drive each factor? |
+| Figure S5.5 | GSEA on RNA weights, an independent pathway check |
+
+# Setup
+
+```{r libraries}
+#| output: false
+library(MOFA2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(forcats)
+library(ggplot2)
+library(patchwork)
+library(survival)
+library(survminer)
+library(broom)
+library(fgsea)
+library(msigdbr)
+library(gt)
+library(writexl)
+```
+
+```{r load}
+data_dir <- "data"
+mofa_dir <- "mofa"
+fig_dir  <- "figures"
+tab_dir  <- "tables"
+dir.create(fig_dir, showWarnings = FALSE)
+dir.create(tab_dir, showWarnings = FALSE)
+
+meta_corrected_by_cancer <- readRDS(file.path(data_dir, "meta_corrected_by_cancer.rds"))  # 02: site, survival
+gsva_scores_by_cancer    <- readRDS(file.path(data_dir, "gsva_scores_by_cancer.rds"))     # 03: same scores as Table 3.1
+surv_all                 <- readRDS(file.path(data_dir, "surv_all.rds"))                  # 03: per-dimension Cox
+clin_vars_by_cancer      <- readRDS(file.path(data_dir, "clin_vars_by_cancer.rds"))       # 03: Age / Stage / Grade
+
+# Models keyed by version ("corrected", "raw") and cancer; file names are mofa_<CANCER>_<version>.hdf5
+mofa_files <- list.files(mofa_dir, pattern = "^mofa_.*\\.hdf5$", full.names = TRUE)
+models <- list(corrected = list(), raw = list())
+for (f in mofa_files) {
+  parts <- strsplit(sub("\\.hdf5$", "", basename(f)), "_")[[1]]
+  models[[parts[3]]][[parts[2]]] <- suppressWarnings(load_model(f))
+}
+
+mofa_cancers <- names(models$corrected)
+if (length(mofa_cancers) == 0) stop("No corrected MOFA models in ", mofa_dir, "; run 04 first")
+n_cancers <- length(mofa_cancers)
+cat("Corrected models:", paste(mofa_cancers, collapse = ", "), "\n")
+cat("Raw models:", paste(names(models$raw), collapse = ", "), "\n")
+
+min_embed_var <- 1   # % embedding variance a factor must explain to enter Table 5.1
+set.seed(42)
+```
+
+## Plot style
+
+```{r style}
+theme_pub <- function(base_size = 10) {
+  theme_bw(base_size = base_size) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92"),
+          strip.background = element_rect(fill = "grey95", colour = NA),
+          strip.text       = element_text(face = "bold"),
+          legend.position  = "bottom",
+          legend.title     = element_text(size = base_size - 1),
+          plot.tag         = element_text(face = "bold", size = base_size + 2))
+}
+theme_set(theme_pub())
+
+view_levels <- c("Embedding", "RNA", "RPPA", "CNV", "miRNA")
+view_cols   <- c(Embedding = "#1b9e77", RNA = "#d95f02", RPPA = "#7570b3",
+                 CNV = "#e7298a", miRNA = "#66a61e")
+div_fill <- function(lim, name) {
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 0, limits = c(-lim, lim), name = name)
+}
+```
+
+## Helper functions
+
+```{r helpers}
+# Factor scores (one column per factor) + site, survival and the 03 clinical covariates.
+# Joined on the metadata rownames, the same patient key 04 used to build the model.
+factor_df <- function(model, cc) {
+  meta <- meta_corrected_by_cancer[[cc]]
+  meta_slim <- data.frame(sample   = rownames(meta),
+                          TSS.Code = as.character(meta$TSS.Code),
+                          time     = meta$time,
+                          event    = meta$event,
+                          stringsAsFactors = FALSE)
+
+  df <- get_factors(model, factors = "all", as.data.frame = TRUE) %>%
+    mutate(factor = as.character(factor), sample = as.character(sample)) %>%
+    select(sample, factor, value) %>%
+    pivot_wider(names_from = factor, values_from = value) %>%          # one column per factor
+    left_join(meta_slim, by = "sample")
+
+  cv <- clin_vars_by_cancer[[cc]]                                      # Age / Stage / Grade, may be NULL
+  if (!is.null(cv)) df <- left_join(df, rownames_to_column(cv, "sample"), by = "sample")
+  df$TSS <- df$TSS.Code
+  df
+}
+
+# Adjusted R2 of each factor on each variable (adjusted: TSS has many levels)
+factor_r2 <- function(df, vars) {
+  fcols <- grep("^Factor", names(df), value = TRUE)
+  bind_rows(lapply(vars, function(v) {
+    if (!v %in% names(df)) return(NULL)
+    bind_rows(lapply(fcols, function(f) {
+      y <- df[[f]]; x <- df[[v]]
+      ok <- !is.na(y) & !is.na(x)
+      if (sum(ok) < 10 || length(unique(x[ok])) < 2) return(NULL)
+      fit <- lm(y[ok] ~ x[ok])
+      data.frame(Factor = f, Variable = v,
+                 adjR2 = summary(fit)$adj.r.squared,
+                 P = anova(fit)[1, "Pr(>F)"])
+    }))
+  }))
+}
+
+factor_num <- function(f) as.numeric(gsub("\\D", "", f))
+short_f    <- function(f) sub("Factor", "F", f)
+f_levels   <- function(f, prefix = "F") paste0(prefix, sort(unique(factor_num(f))))
+
+# "HALLMARK_TNFA_SIGNALING_VIA_NFKB" -> "TNFA Signaling Via NFKB" (identical to 03)
+clean_pw <- function(x) {
+  caps <- c("DNA", "UV", "MYC", "E2F", "G2M", "TNFA", "NFKB", "IL2", "STAT5", "IL6",
+            "JAK", "STAT3", "KRAS", "MTORC1", "PI3K", "AKT", "MTOR", "TGF", "WNT",
+            "P53", "UP", "DN", "V1", "V2")
+  words <- strsplit(gsub("_", " ", sub("^HALLMARK_", "", x)), " ")
+  vapply(words, function(w)
+    paste(ifelse(w %in% caps, w, paste0(substr(w, 1, 1), tolower(substring(w, 2)))),
+          collapse = " "), character(1))
+}
+
+# Row order from hierarchical clustering of a long table
+cluster_order <- function(df, row, col, val) {
+  m <- df %>%
+    select(all_of(c(row, col, val))) %>%
+    pivot_wider(names_from = all_of(col), values_from = all_of(val), values_fill = 0) %>%
+    column_to_rownames(row) %>% as.matrix()
+  if (nrow(m) < 3) return(rownames(m))
+  rownames(m)[hclust(dist(m))$order]
+}
+
+fmt_p  <- function(p) ifelse(is.na(p), "-", ifelse(p < 0.001, "<0.001", sprintf("%.3f", p)))
+fmt_hr <- function(hr, lo, hi)
+  ifelse(is.na(hr), "-", sprintf("%.2f (%.2f\u2013%.2f)", hr, lo, hi))
+
+# Consistent gt styling for all tables
+style_gt <- function(tbl) {
+  tbl %>%
+    tab_options(table.font.size = 11,
+                heading.title.font.weight = "bold",
+                column_labels.font.weight = "bold",
+                row_group.font.weight = "bold",
+                data_row.padding = px(3),
+                heading.align = "left")
+}
+
+fdf_list <- lapply(mofa_cancers, function(cc) factor_df(models$corrected[[cc]], cc))
+names(fdf_list) <- mofa_cancers
+```
+
+# Main results
+
+## Figure 5.1 Variance explained
+
+**Purpose:** shows what each factor captures. **How to read:** in panel A, a
+factor with variance in both the Embedding column and a molecular column is a
+shared image-molecular axis; these are the factors interpreted in Table 5.1. A
+factor active only in Embedding is morphology the omics do not capture. Panel B
+shows how much of each view the model explains overall.
+
+```{r varexp_compute}
+varexp <- bind_rows(lapply(mofa_cancers, function(cc) {
+  get_variance_explained(models$corrected[[cc]])$r2_per_factor[[1]] %>%
+    as.data.frame() %>% rownames_to_column("Factor") %>% mutate(Cancer = cc)
+}))
+
+varexp_long <- varexp %>%
+  pivot_longer(-c(Factor, Cancer), names_to = "View", values_to = "R2") %>%
+  mutate(View = factor(View, levels = intersect(view_levels, unique(View))),
+         Factor_lab = factor(short_f(Factor), levels = rev(f_levels(Factor))))
+
+r2_total <- bind_rows(lapply(mofa_cancers, function(cc) {
+  r2 <- get_variance_explained(models$corrected[[cc]])$r2_total[[1]]
+  data.frame(Cancer = cc, View = names(r2), R2 = as.numeric(r2))
+})) %>%
+  mutate(View = factor(View, levels = intersect(view_levels, unique(View))))
+```
+
+```{r fig5_1, fig.width=11, fig.height=7}
+p_a <- ggplot(varexp_long, aes(View, Factor_lab, fill = R2)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = ifelse(R2 >= 1, sprintf("%.0f", R2), "")), size = 2.6) +
+  facet_wrap(~ Cancer, nrow = 1, scales = "free_y") +
+  scale_fill_gradient(low = "white", high = "#08306b", name = "Variance explained (%)") +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+p_b <- ggplot(r2_total, aes(View, R2, fill = View)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~ Cancer, nrow = 1) +
+  scale_fill_manual(values = view_cols, guide = "none") +
+  labs(x = NULL, y = "Total variance\nexplained (%)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig5_1 <- (p_a / p_b) + plot_layout(heights = c(3, 1)) +
+  plot_annotation(title = "Figure 5.1 Variance decomposition of MOFA models (corrected embeddings)",
+                  tag_levels = "A")
+fig5_1
+ggsave(file.path(fig_dir, "Fig5_1_variance_explained.pdf"), fig5_1, width = 11, height = 7)
+```
+
+## Figure 5.2 Factors and overall survival
+
+**Purpose:** tests which factors predict survival. **How to read:** a factor
+whose CI excludes 1 in both models is prognostic independently of age, stage
+and grade. If the multivariable HR moves towards 1, the factor's prognostic
+signal overlaps with clinical stage. Covariates are the same as in 03
+(Table 3.3), so the two analyses are directly comparable. Full numbers are in
+Table S5.1.
+
+```{r surv_prep}
+surv_list <- lapply(fdf_list, function(df) {
+  df %>%
+    mutate(os_time  = as.numeric(as.character(time)),     # safe if stored as factor
+           os_event = as.integer(as.character(event))) %>%
+    filter(!is.na(os_time), !is.na(os_event), os_time > 0)   # same definition as 01 and 03
+})
+```
+
+```{r cox}
+run_cox_univar <- function(surv_df, cancer_label = "") {
+  factor_cols <- grep("^Factor", names(surv_df), value = TRUE)
+  map_dfr(factor_cols, function(f) {
+    df  <- surv_df %>% select(os_time, os_event, score = all_of(f)) %>% filter(!is.na(score))
+    fit <- tryCatch(coxph(Surv(os_time, os_event) ~ scale(score), data = df),
+                    error = function(e) NULL)
+    if (is.null(fit)) return(NULL)
+    tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+      mutate(Factor = f, Cancer = cancer_label)
+  }) %>%
+    select(Cancer, Factor, HR = estimate, CI_lo = conf.low, CI_hi = conf.high, p.value) %>%
+    mutate(fdr = p.adjust(p.value, method = "BH"))
+}
+
+run_cox_multivar <- function(surv_df, cancer_label = "", covariates = NULL) {
+  factor_cols <- grep("^Factor", names(surv_df), value = TRUE)
+
+  # Keep covariates with enough data and variation
+  covariates <- covariates %>%
+    intersect(names(surv_df)) %>%
+    Filter(function(v) {
+      x <- surv_df[[v]]
+      sum(!is.na(x)) >= 20 && length(unique(na.omit(x))) >= 2
+    }, .)
+  message(cancer_label, " covariates: ", paste(covariates, collapse = ", "))
+
+  map_dfr(factor_cols, function(f) {
+    df <- surv_df %>%
+      select(os_time, os_event, score = all_of(f), any_of(covariates)) %>%
+      filter(!is.na(score)) %>%
+      mutate(across(where(is.character), as.factor))
+    df <- df[complete.cases(df), ]
+    if (nrow(df) < 20) return(NULL)
+
+    cov_str <- if (length(covariates) > 0) paste("+", paste(covariates, collapse = " + ")) else ""
+    fit <- tryCatch(coxph(as.formula(paste0("Surv(os_time, os_event) ~ scale(score)", cov_str)),
+                          data = df), error = function(e) NULL)
+    if (is.null(fit)) return(NULL)
+
+    tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+      filter(term == "scale(score)") %>%
+      mutate(Factor = f, Cancer = cancer_label, n_used = nrow(df))
+  }) %>%
+    select(Cancer, Factor, n_used, HR = estimate, CI_lo = conf.low, CI_hi = conf.high, p.value) %>%
+    mutate(fdr = p.adjust(p.value, method = "BH"))
+}
+
+cox_uni <- bind_rows(lapply(names(surv_list), function(cc)
+  run_cox_univar(surv_list[[cc]], cc)))
+cox_mv  <- bind_rows(lapply(names(surv_list), function(cc)
+  run_cox_multivar(surv_list[[cc]], cc, c("Age", "Stage", "Grade"))))
+```
+
+```{r fig5_2, fig.width=11, fig.height=6}
+forest_df <- bind_rows(
+  cox_uni %>% mutate(Model = "Univariable"),
+  cox_mv  %>% select(-n_used) %>% mutate(Model = "Multivariable")
+) %>%
+  mutate(Factor_lab = fct_reorder(short_f(Factor), factor_num(Factor), .desc = TRUE),
+         Model = factor(Model, levels = c("Univariable", "Multivariable")))
+
+dodge <- position_dodge(width = 0.6)
+
+fig5_2 <- ggplot(forest_df, aes(Factor_lab, HR, colour = Model, shape = Model)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(ymin = CI_lo, ymax = CI_hi), width = 0, linewidth = 0.6,
+                position = dodge) +
+  geom_point(size = 2, position = dodge) +
+  scale_y_log10() +
+  coord_flip() +
+  facet_wrap(~ Cancer, nrow = 1, scales = "free") +
+  scale_colour_manual(values = c(Univariable = "#2980b9", Multivariable = "#c0392b")) +
+  scale_shape_manual(values = c(Univariable = 16, Multivariable = 17)) +
+  labs(title = "Figure 5.2 MOFA factors and overall survival",
+       x = NULL, y = "Hazard ratio per 1 SD (95% CI, log scale)", colour = NULL, shape = NULL)
+
+fig5_2
+ggsave(file.path(fig_dir, "Fig5_2_forest.pdf"), fig5_2, width = 11, height = 6)
+```
+
+## Figure 5.3 Factors and Hallmark pathways
+
+**Purpose:** names the biology of each factor. **How to read:** red means the
+pathway is more active in patients with high scores on that factor. GSVA
+scores are the same as in 03, so factor pathways can be compared directly with
+the dimension pathways in Table 3.1.
+
+```{r gsva_compute}
+gsva_cor <- bind_rows(lapply(mofa_cancers, function(cc) {
+  sc <- gsva_scores_by_cancer[[cc]]
+  if (is.null(sc)) return(NULL)
+  fmat <- get_factors(models$corrected[[cc]], factors = "all")[[1]]   # patients x factors
+
+  # 03 saves scores as patients x pathways; transpose if they arrive the other way
+  if (sum(rownames(fmat) %in% colnames(sc)) > sum(rownames(fmat) %in% rownames(sc)))
+    sc <- t(as.matrix(sc))
+
+  common <- intersect(rownames(fmat), rownames(sc))
+  if (length(common) < 20) return(NULL)
+
+  cor(fmat[common, , drop = FALSE], sc[common, , drop = FALSE],
+      method = "spearman", use = "pairwise.complete.obs") %>%
+    as.data.frame() %>% rownames_to_column("Factor") %>%
+    pivot_longer(-Factor, names_to = "Pathway", values_to = "r") %>%
+    mutate(Cancer = cc, n = length(common))
+})) %>%
+  # P from the t approximation for Spearman r (same as 03); FDR within cancer type
+  mutate(t = r * sqrt((n - 2) / pmax(1 - r^2, 1e-12)),
+         P = 2 * pt(-abs(t), df = n - 2)) %>%
+  group_by(Cancer) %>% mutate(FDR = p.adjust(P, method = "BH")) %>% ungroup()
+```
+
+```{r fig5_3, fig.width=11, fig.height=7}
+top_pw <- gsva_cor %>% group_by(Pathway) %>% summarise(mx = max(abs(r))) %>%
+  slice_max(mx, n = 20, with_ties = FALSE) %>% pull(Pathway)
+
+gsva_plot <- gsva_cor %>%
+  filter(Pathway %in% top_pw) %>%
+  mutate(Col = paste(Cancer, Factor))
+pw_order <- cluster_order(gsva_plot, "Pathway", "Col", "r")
+
+gsva_plot <- gsva_plot %>%
+  mutate(Pathway_lab = factor(clean_pw(Pathway), levels = clean_pw(pw_order)),
+         Factor_lab  = factor(short_f(Factor), levels = f_levels(Factor)),
+         star = ifelse(FDR < 0.05, "*", ""))
+
+lim <- max(abs(gsva_plot$r))
+fig5_3 <- ggplot(gsva_plot, aes(Factor_lab, Pathway_lab, fill = r)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = star), size = 3, vjust = 0.75) +
+  facet_grid(. ~ Cancer, scales = "free_x", space = "free_x") +
+  div_fill(lim, "Spearman r") +
+  labs(title = "Figure 5.3 MOFA factors and GSVA Hallmark pathways (20 strongest; * FDR < 0.05)",
+       x = "MOFA factor", y = NULL) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(size = 7))
+
+fig5_3
+ggsave(file.path(fig_dir, "Fig5_3_GSVA_correlation.pdf"), fig5_3, width = 11, height = 7)
+```
+
+## Table 5.1 Integrated interpretation of image-associated factors
+
+**Purpose:** one row per factor that explains at least 1% of embedding
+variance, bringing every result together. **How to read** left to right: how
+much image and RNA variance the factor shares; which embedding dimensions
+drive it († = also prognostic in Table 3.1); which pathways it reflects (GSVA
+and GSEA should agree in direction); and whether it predicts survival,
+unadjusted and adjusted. A factor with † dimensions, consistent pathways and a
+significant adjusted HR is the strongest integrated finding.
+
+```{r characterise}
+# Embedding weights, all factors
+embed_w <- bind_rows(lapply(mofa_cancers, function(cc) {
+  get_weights(models$corrected[[cc]], views = "Embedding",
+              factors = "all", as.data.frame = TRUE) %>%
+    mutate(Cancer = cc, factor = as.character(factor),
+           feature = as.character(feature), abs_weight = abs(value))
+}))
+
+# Dimensions significant in the embedding-level analysis (03: corrected, FDR < 0.05)
+surv_keys <- surv_all %>%
+  filter(Correction == "ComBat", !is.na(FDR), FDR < 0.05) %>%
+  transmute(key = paste(Cancer, Feature)) %>%
+  pull(key)
+
+embed_top <- embed_w %>%
+  group_by(Cancer, factor) %>%
+  slice_max(abs_weight, n = 10, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(In_03 = paste(Cancer, feature) %in% surv_keys)
+
+# GSEA on RNA weights (ranked lists are the top-variance genes selected in 04)
+pathways_hallmark <- msigdbr(species = "Homo sapiens", collection = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+gsea_res <- bind_rows(lapply(mofa_cancers, function(cc) {
+  m <- models$corrected[[cc]]
+  if (!"RNA" %in% views_names(m)) return(NULL)
+  w <- get_weights(m, views = "RNA", factors = "all", as.data.frame = TRUE) %>%
+    mutate(factor = as.character(factor), feature = as.character(feature))
+
+  bind_rows(lapply(unique(w$factor), function(f) {
+    fw    <- w[w$factor == f, ]
+    ranks <- sort(setNames(fw$value, fw$feature), decreasing = TRUE)
+    set.seed(42)
+    as.data.frame(suppressWarnings(fgsea(pathways_hallmark, ranks,
+                                         minSize = 15, maxSize = 500))) %>%
+      select(pathway, pval, padj, NES, size) %>%
+      mutate(Factor = f, Cancer = cc)
+  }))
+}))
+```
+
+```{r summary_build}
+top_dims <- embed_top %>%
+  group_by(Cancer, factor) %>%
+  slice_max(abs_weight, n = 3, with_ties = FALSE) %>%
+  summarise(Top_dims = paste0(sub("slide_feat_", "", feature),
+                              ifelse(In_03, "\u2020", ""), collapse = ", "),
+            .groups = "drop") %>%
+  rename(Factor = factor)
+
+empty_join <- function(col) tibble(Cancer = character(), Factor = character(), !!col := character())
+
+top_gsva <- if (nrow(gsva_cor) > 0) {
+  gsva_cor %>% filter(FDR < 0.05) %>%
+    group_by(Cancer, Factor) %>% slice_max(abs(r), n = 2, with_ties = FALSE) %>%
+    summarise(GSVA = paste0(clean_pw(Pathway), " (", sprintf("%+.2f", r), ")",
+                            collapse = "; "), .groups = "drop")
+} else empty_join("GSVA")
+
+top_gsea <- if (nrow(gsea_res) > 0) {
+  gsea_res %>% filter(padj < 0.05) %>%
+    group_by(Cancer, Factor) %>% slice_min(padj, n = 2, with_ties = FALSE) %>%
+    summarise(GSEA = paste0(clean_pw(pathway), " (", sprintf("%+.1f", NES), ")",
+                            collapse = "; "), .groups = "drop")
+} else empty_join("GSEA")
+
+factor_summary <- varexp %>%
+  select(Cancer, Factor, any_of(c("Embedding", "RNA"))) %>%
+  rename_with(~ paste0("VarExp_", .x), any_of(c("Embedding", "RNA")))
+for (v in c("VarExp_Embedding", "VarExp_RNA"))
+  if (!v %in% names(factor_summary)) factor_summary[[v]] <- NA_real_
+
+factor_summary <- factor_summary %>%
+  left_join(top_dims, by = c("Cancer", "Factor")) %>%
+  left_join(top_gsva, by = c("Cancer", "Factor")) %>%
+  left_join(top_gsea, by = c("Cancer", "Factor")) %>%
+  left_join(cox_uni %>% select(Cancer, Factor, HR, CI_lo, CI_hi, fdr),
+            by = c("Cancer", "Factor")) %>%
+  left_join(cox_mv %>% select(Cancer, Factor, HR_adj = HR, lo_adj = CI_lo,
+                              hi_adj = CI_hi, fdr_adj = fdr),
+            by = c("Cancer", "Factor")) %>%
+  arrange(Cancer, factor_num(Factor))
+
+write_xlsx(factor_summary, file.path(tab_dir, "Table5_1_factor_summary_full.xlsx"))
+```
+
+```{r table5_1}
+tbl5_1 <- factor_summary %>%
+  filter(VarExp_Embedding >= min_embed_var) %>%
+  mutate(`HR (95% CI)`     = fmt_hr(HR, CI_lo, CI_hi),
+         FDR_txt           = fmt_p(fdr),
+         `Adj HR (95% CI)` = fmt_hr(HR_adj, lo_adj, hi_adj),
+         FDR_adj_txt       = fmt_p(fdr_adj)) %>%
+  select(Cancer, Factor, VarExp_Embedding, VarExp_RNA, Top_dims, GSVA, GSEA,
+         `HR (95% CI)`, FDR_txt, `Adj HR (95% CI)`, FDR_adj_txt, fdr, fdr_adj) %>%
+  gt(groupname_col = "Cancer") %>%
+  tab_header(title = "Table 5.1 Interpretation of image-associated MOFA factors",
+             subtitle = paste0("Factors explaining \u2265 ", min_embed_var,
+                               "% of embedding variance")) %>%
+  tab_spanner(label = "Variance explained (%)", columns = c(VarExp_Embedding, VarExp_RNA)) %>%
+  tab_spanner(label = "Biological interpretation", columns = c(Top_dims, GSVA, GSEA)) %>%
+  tab_spanner(label = "Overall survival",
+              columns = c(`HR (95% CI)`, FDR_txt, `Adj HR (95% CI)`, FDR_adj_txt)) %>%
+  fmt_number(columns = c(VarExp_Embedding, VarExp_RNA), decimals = 1) %>%
+  cols_label(VarExp_Embedding = "Embedding", VarExp_RNA = "RNA",
+             Top_dims = "Top embedding dimensions",
+             GSVA = "GSVA pathways (r)", GSEA = "GSEA pathways (NES)",
+             FDR_txt = "FDR", FDR_adj_txt = "Adj FDR") %>%
+  sub_missing(missing_text = "\u2013") %>%
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_body(columns = c(`HR (95% CI)`, FDR_txt),
+                                   rows = !is.na(fdr) & fdr < 0.05)) %>%
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_body(columns = c(`Adj HR (95% CI)`, FDR_adj_txt),
+                                   rows = !is.na(fdr_adj) & fdr_adj < 0.05)) %>%
+  cols_hide(c(fdr, fdr_adj)) %>%
+  cols_width(Top_dims ~ px(140), GSVA ~ px(230), GSEA ~ px(230)) %>%
+  tab_footnote("\u2020 Dimension also associated with survival in the embedding-level analysis (Table 3.1).") %>%
+  tab_footnote(paste("GSVA and GSEA: two strongest Hallmark associations with FDR < 0.05.",
+                     "HR per 1 SD of factor score; adjusted for age, stage and grade where available;",
+                     "bold, FDR < 0.05.")) %>%
+  style_gt()
+
+gtsave(tbl5_1, file.path(tab_dir, "Table5_1_factor_summary.html"))
+tbl5_1
+```
+
+# Supplementary analyses
+
+## Table S5.1 Full Cox results
+
+**Purpose:** the numbers behind Figure 5.2, for every factor.
+
+```{r tableS5_1}
+cox_table <- cox_uni %>%
+  left_join(cox_mv %>% select(Cancer, Factor, n_used,
+                              HR_adj = HR, lo_adj = CI_lo, hi_adj = CI_hi, fdr_adj = fdr),
+            by = c("Cancer", "Factor")) %>%
+  arrange(Cancer, factor_num(Factor)) %>%
+  mutate(`HR (95% CI)`          = fmt_hr(HR, CI_lo, CI_hi),
+         P                      = fmt_p(p.value),
+         FDR                    = fmt_p(fdr),
+         `Adjusted HR (95% CI)` = fmt_hr(HR_adj, lo_adj, hi_adj),
+         `Adjusted FDR`         = fmt_p(fdr_adj),
+         n_adj = ifelse(is.na(n_used), "-", as.character(n_used)))
+
+tblS5_1 <- cox_table %>%
+  select(Cancer, Factor, `HR (95% CI)`, P, FDR, n_adj,
+         `Adjusted HR (95% CI)`, `Adjusted FDR`, fdr, fdr_adj) %>%
+  gt(groupname_col = "Cancer") %>%
+  tab_header(title = "Table S5.1 MOFA factors and overall survival",
+             subtitle = "Cox proportional hazards; HR per 1 SD of factor score") %>%
+  tab_spanner(label = "Univariable", columns = c(`HR (95% CI)`, P, FDR)) %>%
+  tab_spanner(label = "Multivariable", columns = c(n_adj, `Adjusted HR (95% CI)`, `Adjusted FDR`)) %>%
+  cols_label(n_adj = "n", `Adjusted HR (95% CI)` = "HR (95% CI)", `Adjusted FDR` = "FDR") %>%
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_body(columns = c(`HR (95% CI)`, FDR), rows = fdr < 0.05)) %>%
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_body(columns = c(`Adjusted HR (95% CI)`, `Adjusted FDR`),
+                                   rows = !is.na(fdr_adj) & fdr_adj < 0.05)) %>%
+  cols_hide(c(fdr, fdr_adj)) %>%
+  tab_footnote("Multivariable models adjusted for age, stage and grade where available (same covariates as Table 3.3). Bold: FDR < 0.05 (Benjamini-Hochberg within cancer type).") %>%
+  style_gt()
+
+gtsave(tblS5_1, file.path(tab_dir, "TableS5_1_cox.html"))
+tblS5_1
+```
+
+## Figure S5.1 Kaplan-Meier curves for the top factor
+
+**Purpose:** a visual of the strongest factor-survival association in each
+cancer. **How to read:** the factor shown is the one with the smallest
+univariable P, so the log-rank P is descriptive, not a confirmatory test. Use
+Figure 5.2 and Table S5.1 for inference.
+
+```{r figS5_1, fig.width=12, fig.height=8}
+km_plots <- list()
+for (cc in names(surv_list)) {
+  top <- cox_uni %>% filter(Cancer == cc) %>% slice_min(p.value, n = 1, with_ties = FALSE)
+  if (nrow(top) == 0) next
+
+  d <- surv_list[[cc]]
+  d$Group <- factor(ifelse(d[[top$Factor]] > median(d[[top$Factor]], na.rm = TRUE),
+                           "High", "Low"), levels = c("High", "Low"))
+  fit <- survfit(Surv(os_time, os_event) ~ Group, data = d)
+
+  km_plots[[cc]] <- ggsurvplot(
+    fit, data = d, pval = TRUE, pval.size = 3.5,
+    risk.table = TRUE, risk.table.height = 0.25, fontsize = 3,
+    palette = c("#c0392b", "#2980b9"), legend.labs = c("High", "Low"),
+    legend.title = paste0(top$Factor, ":"),
+    title = paste0(cc, " \u2013 ", top$Factor,
+                   " (HR ", sprintf("%.2f", top$HR), ", FDR ", fmt_p(top$fdr), ")"),
+    xlab = "Days", ylab = "Overall survival",
+    ggtheme = theme_pub(), tables.theme = theme_cleantable()
+  )
+}
+
+km_arr <- arrange_ggsurvplots(km_plots, print = TRUE,
+                              ncol = min(3, length(km_plots)),
+                              nrow = ceiling(length(km_plots) / 3))
+ggsave(file.path(fig_dir, "FigS5_1_KM_top_factors.pdf"), km_arr, width = 12, height = 8)
+```
+
+## Figure S5.2 and Table S5.2 Batch-correction check
+
+**Purpose:** checks that site correction carries through to the integrated
+model. **How to read:** lower site R2 for Corrected than Raw factors means the
+correction propagates. Molecular views are identical in both models, so any
+remaining site association comes from the omics, not the image. Factors from
+separately fitted models do not correspond one-to-one, so distributions are
+compared, not individual factors.
+
+```{r tss_compute}
+raw_cancers <- intersect(mofa_cancers, names(models$raw))
+
+r2_tss <- bind_rows(lapply(raw_cancers, function(cc) {
+  bind_rows(lapply(c("corrected", "raw"), function(ver) {
+    df <- factor_df(models[[ver]][[cc]], cc)
+    factor_r2(df, "TSS") %>% mutate(Cancer = cc, Version = ver)
+  }))
+})) %>%
+  mutate(Version = factor(Version, levels = c("raw", "corrected"),
+                          labels = c("Raw", "Corrected")))
+```
+
+```{r figS5_2, fig.width=10, fig.height=4}
+if (nrow(r2_tss) > 0) {
+  figS5_2 <- ggplot(r2_tss, aes(Version, adjR2, fill = Version)) +
+    geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.4) +
+    geom_jitter(aes(colour = Version), width = 0.12, size = 1.6) +
+    facet_wrap(~ Cancer, nrow = 1) +
+    scale_fill_manual(values = c(Raw = "#c0392b", Corrected = "#2980b9"), guide = "none") +
+    scale_colour_manual(values = c(Raw = "#c0392b", Corrected = "#2980b9"), guide = "none") +
+    labs(title = "Figure S5.2 Site association of MOFA factors, raw vs corrected embeddings",
+         x = NULL, y = expression(Adjusted~R^2~"(tissue source site)"))
+  figS5_2
+  ggsave(file.path(fig_dir, "FigS5_2_TSS_raw_vs_corrected.pdf"), figS5_2, width = 10, height = 4)
+} else cat("No raw-embedding models available.\n")
+```
+
+```{r tableS5_2}
+if (nrow(r2_tss) > 0) {
+  tblS5_2 <- r2_tss %>%
+    group_by(Cancer, Version) %>%
+    summarise(Factors = n(), Max = max(adjR2), Median = median(adjR2),
+              Sig = sum(P < 0.05), .groups = "drop") %>%
+    gt(groupname_col = "Cancer") %>%
+    tab_header(title = "Table S5.2 Site association of MOFA factors, raw vs corrected embeddings") %>%
+    fmt_number(columns = c(Max, Median), decimals = 3) %>%
+    cols_label(Max = "Max adj. R\u00b2", Median = "Median adj. R\u00b2",
+               Sig = "Factors with P < 0.05") %>%
+    tab_footnote("Only the embedding view is batch-corrected; molecular views are identical in both models.") %>%
+    style_gt()
+  gtsave(tblS5_2, file.path(tab_dir, "TableS5_2_TSS_check.html"))
+  tblS5_2
+}
+```
+
+## Figure S5.3 Clinical associations
+
+**Purpose:** shows whether factors track clinical variables. **How to read:**
+a factor associated with stage or grade explains why its adjusted HR in
+Figure 5.2 moves towards 1. Age is median-imputed for missing values, so its
+R2 is slightly conservative.
+
+```{r figS5_3, fig.width=11, fig.height=4.5}
+var_labels <- c(TSS = "Tissue source site", Age = "Age", Stage = "Stage", Grade = "Grade")
+
+r2_clin <- bind_rows(lapply(mofa_cancers, function(cc) {
+  df <- fdf_list[[cc]] %>%                                   # "Missing" is a Cox level, not data
+    mutate(across(any_of(c("Stage", "Grade")), ~ na_if(as.character(.x), "Missing")))
+  factor_r2(df, names(var_labels)) %>% mutate(Cancer = cc)
+})) %>%
+  mutate(Variable   = factor(var_labels[Variable], levels = rev(var_labels)),
+         Factor_lab = factor(short_f(Factor), levels = f_levels(Factor)),
+         R2_plot    = pmax(adjR2, 0),
+         star       = ifelse(P < 0.05, "*", ""))
+
+figS5_3 <- ggplot(r2_clin, aes(Factor_lab, Variable, fill = R2_plot)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = star), size = 3, vjust = 0.75) +
+  facet_grid(. ~ Cancer, scales = "free_x", space = "free_x") +
+  scale_fill_gradient(low = "white", high = "#08306b", name = expression(Adjusted~R^2)) +
+  labs(title = "Figure S5.3 MOFA factors and clinical variables (* P < 0.05)",
+       x = "MOFA factor", y = NULL) +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(size = 7))
+
+figS5_3
+ggsave(file.path(fig_dir, "FigS5_3_clinical_associations.pdf"), figS5_3, width = 11, height = 4.5)
+```
+
+## Figure S5.4 Embedding dimensions driving each factor
+
+**Purpose:** links factors back to individual embedding dimensions.
+**How to read:** dimensions marked † were prognostic on their own in 03; they
+are the bridge between the per-dimension analysis and the MOFA factors.
+
+```{r figS5_4, fig.width=11, fig.height=2.6 * n_cancers}
+dims_show <- embed_top %>%
+  group_by(Cancer, factor) %>% slice_max(abs_weight, n = 5, with_ties = FALSE) %>%
+  ungroup() %>% distinct(Cancer, feature, In_03)
+
+embed_plot <- embed_w %>%
+  inner_join(dims_show, by = c("Cancer", "feature")) %>%
+  mutate(Dim = paste0(sub("slide_feat_", "", feature), ifelse(In_03, "\u2020", "")),
+         Factor_lab = factor(short_f(factor), levels = rev(f_levels(factor))))
+
+lim <- max(abs(embed_plot$value))
+figS5_4 <- ggplot(embed_plot, aes(Dim, Factor_lab, fill = value)) +
+  geom_tile(colour = "white") +
+  facet_wrap(~ Cancer, ncol = 1, scales = "free") +
+  div_fill(lim, "MOFA weight") +
+  labs(title = "Figure S5.4 Embedding weights of each factor (top 5 dimensions per factor)",
+       x = "Embedding dimension", y = NULL) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, size = 6),
+        axis.text.y = element_text(size = 7))
+
+figS5_4
+ggsave(file.path(fig_dir, "FigS5_4_embedding_weights.pdf"), figS5_4,
+       width = 11, height = 2.6 * n_cancers)
+```
+
+## Figure S5.5 GSEA on RNA factor weights
+
+**Purpose:** an independent check of Figure 5.3. GSVA correlates patient-level
+pathway scores with factor scores, while GSEA tests the genes the factor loads
+on. **How to read:** pathways significant in both, with the same direction,
+are the most robust factor interpretations. The ranked list contains only the
+5,000 most variable genes kept in 04, so gene sets made up mostly of
+low-variance genes cannot reach significance.
+
+```{r figS5_5, fig.width=11, fig.height=7}
+if (nrow(gsea_res) > 0) {
+  top_gsea_pw <- gsea_res %>% group_by(pathway) %>%
+    summarise(best = min(padj, na.rm = TRUE)) %>%
+    filter(best < 0.05) %>% slice_min(best, n = 25, with_ties = FALSE) %>% pull(pathway)
+
+  gsea_plot <- gsea_res %>%
+    filter(pathway %in% top_gsea_pw) %>%
+    mutate(Col = paste(Cancer, Factor))
+  gsea_order <- cluster_order(gsea_plot, "pathway", "Col", "NES")
+
+  gsea_plot <- gsea_plot %>%
+    mutate(Pathway_lab = factor(clean_pw(pathway), levels = clean_pw(gsea_order)),
+           Factor_lab  = factor(short_f(Factor), levels = f_levels(Factor)),
+           star = ifelse(!is.na(padj) & padj < 0.05, "*", ""))
+
+  lim <- max(abs(gsea_plot$NES), na.rm = TRUE)
+  figS5_5 <- ggplot(gsea_plot, aes(Factor_lab, Pathway_lab, fill = NES)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = star), size = 3, vjust = 0.75) +
+    facet_grid(. ~ Cancer, scales = "free_x", space = "free_x") +
+    div_fill(lim, "NES") +
+    labs(title = "Figure S5.5 Hallmark GSEA of RNA factor weights (* FDR < 0.05)",
+         x = "MOFA factor", y = NULL) +
+    theme(panel.grid = element_blank(), axis.text.x = element_text(size = 7))
+
+  figS5_5
+  ggsave(file.path(fig_dir, "FigS5_5_GSEA.pdf"), figS5_5, width = 11, height = 7)
+} else cat("No GSEA results (no RNA view in any model).\n")
+```
+
+# Save results
+
+```{r save}
+saveRDS(list(varexp = varexp, r2_total = r2_total,
+             cox_uni = cox_uni, cox_mv = cox_mv,
+             gsva_cor = gsva_cor, gsea = gsea_res,
+             embed_top = embed_top, r2_tss = r2_tss, r2_clinical = r2_clin,
+             factor_summary = factor_summary),
+        file.path(data_dir, "mofa_results.rds"))
+```
+
+```{r session}
+sessionInfo()
+```

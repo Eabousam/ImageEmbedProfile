@@ -1,0 +1,374 @@
+---
+title: "04 - MOFA Model Fitting"
+subtitle: "Corrected Prov-GigaPath embeddings integrated with molecular views"
+format: html
+editor: visual
+---
+
+Fits one MOFA+ model per cancer type, integrating the corrected slide embedding
+with RNA-seq, RPPA, copy number and miRNA. A second model per cancer uses the
+raw embeddings; it is used only in 05 to check that batch correction carries
+through to the latent factors.
+
+Inputs: `embed_corrected_by_cancer.rds`, `embed_raw_by_cancer.rds`,
+`meta_corrected_by_cancer.rds`, `omics_by_cancer.rds`
+
+Outputs: `mofa/mofa_<CANCER>_<corrected|raw>.hdf5`, `mofa_input_summary.rds`
+
+## Libraries
+
+```{r, message=FALSE}
+#| output: false
+library(MOFA2)
+library(dplyr)
+library(gt)
+library(ggplot2)
+```
+
+## Load data
+
+```{r load}
+data_dir <- "data"
+mofa_dir <- "mofa"
+dir.create(mofa_dir, showWarnings = FALSE)
+
+embed_corrected_by_cancer <- readRDS(file.path(data_dir, "embed_corrected_by_cancer.rds"))
+embed_raw_by_cancer       <- readRDS(file.path(data_dir, "embed_raw_by_cancer.rds"))
+meta_corrected_by_cancer  <- readRDS(file.path(data_dir, "meta_corrected_by_cancer.rds"))
+omics_by_cancer           <- readRDS(file.path(data_dir, "omics_by_cancer.rds"))
+
+main_cancers <- c("KIRC", "COAD", "LUAD", "OV", "READ")
+mofa_cancers <- intersect(main_cancers, names(embed_corrected_by_cancer))
+cat("Cancers:", paste(mofa_cancers, collapse = ", "), "\n")
+```
+
+## Config
+
+```{r config}
+# Molecular views: short view name -> curatedTCGAData experiment pattern
+view_patterns <- c(RNA   = "RNASeq2GeneNorm",
+                   RPPA  = "RPPAArray",
+                   CNV   = "GISTIC_AllByGene",
+                   miRNA = "miRNASeqGene")
+
+# Features kept per view, by variance (NULL keeps all). Full 20k-gene matrices
+# dominate the model and slow convergence.
+n_top <- list(RNA = 5000, RPPA = NULL, CNV = 5000, miRNA = 500)
+
+min_samples_view <- 20      # drop a view observed in fewer patients
+n_factors        <- 15
+convergence      <- "slow"  # "fast" for testing only
+versions_to_fit  <- c("corrected", "raw")
+overwrite        <- TRUE    # TRUE refits every model; set FALSE to skip models already on disk
+set.seed(42)
+```
+
+## Remove old models
+
+Models fitted with earlier versions of this file are deleted, so every model is
+refitted with the current view preparation. Skipped when `overwrite` is FALSE.
+
+```{r clean}
+if (overwrite) {
+  old <- list.files(mofa_dir, pattern = "\\.hdf5$", full.names = TRUE)
+  if (length(old) > 0) { file.remove(old); cat("Removed", length(old), "old model files\n") }
+}
+```
+
+## Available views
+
+```{r views}
+view_avail <- sapply(mofa_cancers, function(cc) {
+  sapply(view_patterns, function(p) any(grepl(p, names(omics_by_cancer[[cc]]))))
+})
+print(view_avail)   # all TRUE expected
+```
+
+## Helper functions
+
+```{r helpers}
+# One assay as a numeric matrix with unique feature names.
+# Experiments are named like "OV_RNASeq2GeneNorm-20160128"; match by pattern.
+get_assay <- function(omics_list, pattern) {
+  idx <- grep(pattern, names(omics_list), ignore.case = TRUE)
+  if (length(idx) == 0) return(NULL)
+  x <- omics_list[[idx[1]]]
+
+  if (methods::is(x, "SummarizedExperiment")) {
+    m  <- SummarizedExperiment::assay(x)
+    rd <- SummarizedExperiment::rowData(x)
+    if (is.null(rownames(m)) && "Gene.Symbol" %in% names(rd))
+      rownames(m) <- rd$Gene.Symbol
+  } else {
+    m <- as.matrix(x)
+  }
+
+  if (is.null(rownames(m)))
+    stop(pattern, " has no feature names; set rownames when building omics_by_cancer")
+  rownames(m) <- make.unique(as.character(rownames(m)))
+  storage.mode(m) <- "numeric"
+  m
+}
+
+# Transform, filter, and keep the top-variance features of one view
+prep_view <- function(mat, view, top_n = NULL) {
+  # Keep only patients who have this assay. Missingness below is then judged
+  # among measured patients, so a view measured in fewer than half the cohort
+  # (e.g. miRNA in KIRC) is not dropped entirely. Missing patients are
+  # re-added as NA by align_samples().
+  mat <- mat[, colSums(!is.na(mat)) > 0, drop = FALSE]
+
+  # Count-scale views are log-transformed, unless already on a log scale (negatives present)
+  if (view %in% c("RNA", "miRNA") && min(mat, na.rm = TRUE) >= 0) {
+    if (view == "miRNA")                                     # raw read counts: correct for sequencing depth
+      mat <- sweep(mat, 2, colSums(mat, na.rm = TRUE), "/") * 1e6   # counts per million
+    mat <- log2(mat + 1)
+  }
+
+  mat  <- mat[rowMeans(is.na(mat)) < 0.5, , drop = FALSE]   # features missing in most measured patients
+  v    <- apply(mat, 1, var, na.rm = TRUE)
+  keep <- which(v > 0)                                       # drops NA and constant features
+  keep <- keep[order(v[keep], decreasing = TRUE)]            # most variable first
+  if (!is.null(top_n)) keep <- head(keep, top_n)
+  mat[keep, , drop = FALSE]
+}
+
+# MOFA requires identical samples (columns) in every view; missing = NA
+align_samples <- function(mat, samples) {
+  out <- matrix(NA_real_, nrow(mat), length(samples),
+                dimnames = list(rownames(mat), samples))
+  common <- intersect(colnames(mat), samples)
+  out[, common] <- mat[, common]
+  out
+}
+
+# Build the view list for one cancer. Both versions use the same patients.
+build_views <- function(cc, embed_source) {
+  samples <- rownames(embed_corrected_by_cancer[[cc]])       # corrected patients define the cohort
+  stopifnot(all(samples %in% rownames(embed_source[[cc]])))
+
+  emb <- t(as.matrix(embed_source[[cc]][samples, , drop = FALSE]))   # features x patients
+  if (is.null(rownames(emb))) rownames(emb) <- paste0("emb_", seq_len(nrow(emb)))
+  views <- list(Embedding = emb)
+
+  for (v in names(view_patterns)) {
+    m <- get_assay(omics_by_cancer[[cc]], view_patterns[[v]])
+    if (is.null(m)) next
+
+    m     <- align_samples(prep_view(m, v, n_top[[v]]), samples)    # NA where a patient lacks the assay
+    n_obs <- sum(colSums(!is.na(m)) > 0)
+    if (nrow(m) < 2 || n_obs < min_samples_view) {
+      cat("  ", v, ": ", nrow(m), " features, ", n_obs, " patients, dropped\n", sep = "")
+      next
+    }
+
+    # Unique feature names across views: suffixes keep RNA gene symbols untouched,
+    # so the GSEA in 05 can match RNA weights to Hallmark gene sets
+    if (v %in% c("RPPA", "CNV")) rownames(m) <- paste0(rownames(m), "_", tolower(v))
+    views[[v]] <- m
+    cat("  ", v, ": ", nrow(m), " features x ", n_obs, " patients\n", sep = "")
+  }
+  views
+}
+
+# Slim metadata stored in the model; full metadata is joined in 05
+build_meta <- function(cc, samples) {
+  m <- meta_corrected_by_cancer[[cc]][samples, , drop = FALSE]
+  data.frame(sample   = samples,
+             Cancer   = cc,
+             TSS.Code = as.character(m$TSS.Code),
+             time     = as.numeric(as.character(m$time)),   # safe if stored as factor
+             event    = as.numeric(as.character(m$event)),
+             stringsAsFactors = FALSE)
+}
+
+fit_mofa <- function(views, meta_slim, outfile) {
+  obj <- create_mofa(views)
+  samples_metadata(obj) <- meta_slim
+
+  data_opts <- get_default_data_options(obj)
+  data_opts$scale_views <- TRUE     # views are on very different scales
+
+  model_opts <- get_default_model_options(obj)
+  model_opts$num_factors <- n_factors
+
+  train_opts <- get_default_training_options(obj)
+  train_opts$convergence_mode <- convergence
+  train_opts$seed <- 42
+
+  obj <- prepare_mofa(obj, data_options = data_opts,
+                      model_options = model_opts, training_options = train_opts)
+  run_mofa(obj, outfile = outfile, use_basilisk = TRUE)
+}
+```
+
+
+
+## Figure S4.1 and Table S4.1 Dimensionality of each view
+
+**Purpose:** shows how concentrated each view's variation is. **How to read:**
+a view whose cumulative curve rises steeply (e.g. CNV, where neighbouring genes
+share copy-number segments) is dominated by a few directions that a 15-factor
+model captures easily. A flat curve (e.g. the embedding) means variation is
+spread over many directions. The value at 15 PCs is the most variance any
+15-component linear model could explain in that view alone, so it is an upper
+bound on that view's total in Figure 5.1B. PCA uses the matrices MOFA receives,
+centred per feature as MOFA does.
+
+```{r view_dimensionality, fig.width=12, fig.height=6}
+view_cols <- c(Embedding = "#1b9e77", RNA = "#d95f02", RPPA = "#7570b3",
+               CNV = "#e7298a", miRNA = "#66a61e")             # same palette as 05
+
+# PCA of one prepared view (features x patients), on the patients who have that view
+pca_view <- function(m) {
+  m <- m[, colSums(!is.na(m)) > 0, drop = FALSE]               # patients measured in this view
+  if (anyNA(m)) {                                              # scattered gaps: feature mean
+    mu  <- rowMeans(m, na.rm = TRUE)
+    idx <- which(is.na(m), arr.ind = TRUE)
+    m[idx] <- mu[idx[, "row"]]
+  }
+  X  <- t(m)                                                   # patients x features
+  ev <- prcomp(X, center = TRUE, scale. = FALSE)$sdev^2        # variance of each PC
+  # Check: the PCs together hold all of the view's variance
+  stopifnot(isTRUE(all.equal(sum(ev), sum(apply(X, 2, var)))))
+  data.frame(PC = seq_along(ev),
+             Var = 100 * ev / sum(ev),                         # % of view variance per PC
+             Cum = 100 * cumsum(ev) / sum(ev),                 # cumulative %
+             Patients = nrow(X), Features = ncol(X))
+}
+
+dim_df <- bind_rows(lapply(mofa_cancers, function(cc) {
+  invisible(capture.output(views <- build_views(cc, embed_corrected_by_cancer)))  # same input as MOFA
+  bind_rows(lapply(names(views), function(v) pca_view(views[[v]]) %>% mutate(Cancer = cc, View = v)))
+})) %>%
+  mutate(View   = factor(View, levels = names(view_cols)),
+         Cancer = factor(Cancer, levels = mofa_cancers))
+
+# Table S4.1: one row per cancer and view
+dim_tab <- dim_df %>%
+  group_by(Cancer, View) %>%
+  summarise(Patients = first(Patients), Features = first(Features),
+            PC1      = Var[1],                                 # share of the single largest direction
+            Top15    = Cum[min(15, n())],                      # upper bound for 15 factors
+            PCs_80   = which(Cum >= 80)[1],                    # PCs needed for 80% of variance
+            Eff_dim  = sum(Var)^2 / sum(Var^2),                # effective number of dimensions
+            .groups  = "drop")
+
+dim_tab %>%
+  gt(groupname_col = "Cancer") %>%
+  fmt_number(columns = c(PC1, Top15, Eff_dim), decimals = 1) %>%
+  cols_label(PC1 = "PC1 (%)", Top15 = "First 15 PCs (%)",
+             PCs_80 = "PCs for 80%", Eff_dim = "Effective dimensions") %>%
+  tab_header(title = "Table S4.1 Dimensionality of each MOFA input view",
+             subtitle = "PCA of the prepared views; first 15 PCs = upper bound for a 15-factor model") %>%
+  tab_footnote("Effective dimensions = (sum of eigenvalues)\u00b2 / sum of squared eigenvalues; 1 = one direction holds all variance.") %>%
+  tab_options(table.font.size = 11, heading.align = "center")
+
+# Figure S4.1: scree (top) and cumulative variance (bottom), first 50 PCs
+plot_df <- bind_rows(
+  dim_df %>% transmute(Cancer, View, PC, value = Var, Measure = "Variance per PC (%)"),
+  dim_df %>% transmute(Cancer, View, PC, value = Cum, Measure = "Cumulative variance (%)")) %>%
+  filter(PC <= 50) %>%
+  mutate(Measure = factor(Measure, levels = c("Variance per PC (%)", "Cumulative variance (%)")))
+
+figS4_1 <- ggplot(plot_df, aes(PC, value, colour = View)) +
+  geom_vline(xintercept = 15, linetype = "dashed", colour = "grey60") +   # number of MOFA factors
+  geom_line(linewidth = 0.7) +
+  facet_grid(Measure ~ Cancer, scales = "free_y", switch = "y") +
+  scale_colour_manual(values = view_cols) +
+  labs(title = "Figure S4.1 Dimensionality of MOFA input views",
+       subtitle = "PCA of each prepared view; dashed line = 15 MOFA factors",
+       x = "Principal component", y = NULL, colour = NULL) +
+  theme_bw(base_size = 10) +
+  theme(panel.grid.minor = element_blank(), strip.placement = "outside",
+        strip.background = element_rect(fill = "grey95", colour = NA),
+        strip.text = element_text(face = "bold"), legend.position = "bottom")
+
+figS4_1
+ggsave(file.path("figures", "FigS4_1_view_dimensionality.pdf"), figS4_1, width = 12, height = 6)
+```
+
+
+
+* Copy-number variation was concentrated in few directions (85–90% of its variance in the first 15 principal components in COAD, KIRC and READ; Table S4.1), consistent with large correlated genomic segments, and dominated the leading MOFA factors. Dimensionality alone did not explain the embedding’s small contribution: RNA was more dispersed than the embedding (about 45% versus 50–65% in 15 components), yet MOFA explained substantially more RNA variance. The embedding’s low variance explained therefore reflects limited sharing with the molecular views; most morphological variation encoded by Prov-GigaPath is not captured by bulk molecular profiles, consistent with its independent prognostic value (Table 3.3).
+
+
+## Fit models
+
+Two models per cancer (corrected and raw embedding), 10 in total. Each view line
+should show features x patients; every cancer should keep all five views.
+
+```{r fit}
+for (cc in mofa_cancers) {
+  for (ver in versions_to_fit) {
+
+    outfile <- file.path(normalizePath(mofa_dir), paste0("mofa_", cc, "_", ver, ".hdf5"))
+    if (file.exists(outfile) && !overwrite) {
+      cat(cc, ver, ": exists, skipping\n"); next
+    }
+
+    cat("\n==== Fitting", cc, "(", ver, ") ====\n")
+    src   <- if (ver == "corrected") embed_corrected_by_cancer else embed_raw_by_cancer
+    views <- build_views(cc, src)
+
+    if (length(views) < 2) {
+      cat("  fewer than 2 views, skipping\n"); next
+    }
+
+    tryCatch(
+      fit_mofa(views, build_meta(cc, colnames(views$Embedding)), outfile),
+      error = function(e) cat("  MOFA failed:", conditionMessage(e), "\n")
+    )
+  }
+}
+```
+
+## Table 4.1 MOFA models
+
+**Purpose:** documents what entered each model: patients, features per view and
+number of factors. **How to read:** both versions of a cancer should have the
+same patients and molecular views; only the embedding differs. Total variance
+explained per view is shown graphically in Figure 5.1B.
+
+```{r summary}
+mofa_files <- list.files(mofa_dir, pattern = "^mofa_.*\\.hdf5$", full.names = TRUE)
+
+mofa_summary <- bind_rows(lapply(mofa_files, function(f) {
+  parts <- strsplit(sub("\\.hdf5$", "", basename(f)), "_")[[1]]
+  m     <- suppressWarnings(load_model(f))
+  dims  <- get_dimensions(m)
+  r2    <- get_variance_explained(m)$r2_total[[1]]
+
+  data.frame(Cancer = parts[2], Version = parts[3],
+             Samples = sum(dims$N), Factors = dims$K,
+             Views = paste(names(dims$D), dims$D, sep = "=", collapse = ", "),
+             as.list(setNames(round(r2, 1), paste0("R2_", names(r2)))),
+             check.names = FALSE)
+})) %>% arrange(Cancer, Version)
+
+mofa_summary %>%
+  gt() %>%
+  tab_header(title = "Table 4.1 MOFA models",
+             subtitle = "Features per view and total variance explained (%) per view") %>%
+  sub_missing(missing_text = "-") %>%
+  tab_options(table.font.size = 11, heading.align = "center")
+
+saveRDS(mofa_summary, file.path(data_dir, "mofa_input_summary.rds"))
+```
+
+## Data overview (QC)
+
+Shows, for each view, which patients have data. Gaps are patients missing that
+assay; MOFA still uses their other views.
+
+```{r overview, fig.width=8, fig.height=4}
+for (cc in mofa_cancers) {
+  f <- file.path(mofa_dir, paste0("mofa_", cc, "_corrected.hdf5"))
+  if (!file.exists(f)) next
+  print(plot_data_overview(suppressWarnings(load_model(f))) + ggplot2::ggtitle(cc))
+}
+```
+
+```{r session}
+sessionInfo()
+```
